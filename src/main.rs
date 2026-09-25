@@ -122,9 +122,20 @@ async fn serve_http(
             mcp_config,
         );
 
-    let mcp_router = Router::new()
+    let mut mcp_router = Router::new()
         .nest_service("/mcp", mcp_service)
         .layer(middleware::from_fn(tool_filter_middleware));
+    // Read here rather than into `Config`, which derives `Debug`.
+    if let Some(token) = std::env::var("OBSIDIAN_HTTP_AUTH_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+    {
+        mcp_router = mcp_router.layer(middleware::from_fn_with_state(
+            Arc::<str>::from(token),
+            bearer_auth_middleware,
+        ));
+        tracing::info!("HTTP MCP endpoint requires a bearer token");
+    }
 
     let app = Router::new()
         .route("/health", get(move || health_handler(health_vault.clone())))
@@ -151,6 +162,40 @@ fn allow_bind_host(
     if !bind.is_loopback() && !bind.is_unspecified() {
         mcp_config.allowed_hosts.push(bind.to_string());
     }
+}
+
+/// Refuse an MCP request unless it carries `Authorization: Bearer <token>`.
+/// `/health` sits outside this layer so `serve` and `restart` can probe it.
+async fn bearer_auth_middleware(
+    axum::extract::State(token): axum::extract::State<Arc<str>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    let authorized = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(' '))
+        .is_some_and(|(scheme, presented)| {
+            scheme.eq_ignore_ascii_case("Bearer")
+                && constant_time_eq(presented.trim().as_bytes(), token.as_bytes())
+        });
+    if !authorized {
+        tracing::warn!("rejected HTTP MCP request without a valid bearer token");
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+            "Unauthorized",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 async fn tool_filter_middleware(
@@ -407,6 +452,7 @@ fn print_help() {
              OBSIDIAN_TRANSPORT      Transport: stdio | http        [default: stdio]\n    \
              OBSIDIAN_HTTP_PORT      HTTP listen port               [default: 37842]\n    \
              OBSIDIAN_HTTP_HOST      HTTP bind address              [default: 127.0.0.1]\n    \
+             OBSIDIAN_HTTP_AUTH_TOKEN  Require this bearer token on /mcp  [default: none]\n    \
              OBSIDIAN_WATCH          Enable filesystem watcher      [default: true]\n    \
              OBSIDIAN_LOG_LEVEL      Tracing log level              [default: info]\n    \
              OBSIDIAN_TANTIVY        Enable BM25 full-text index    [default: true]\n    \

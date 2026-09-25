@@ -54,17 +54,24 @@ impl HttpServer {
     }
 
     async fn start_on_host(filter: &str, host: &str) -> Self {
+        Self::start_with(filter, host, None).await
+    }
+
+    async fn start_with(filter: &str, host: &str, auth_token: Option<&str>) -> Self {
         let vault = temporary_vault();
         let port = TcpListener::bind((host, 0))
             .unwrap()
             .local_addr()
             .unwrap()
             .port();
-        let child = server_command(&vault)
+        let mut command = server_command(&vault);
+        command
             .args(["--http", "--host", host, "--port", &port.to_string()])
-            .env("OBSIDIAN_TOOLS", filter)
-            .spawn()
-            .unwrap();
+            .env("OBSIDIAN_TOOLS", filter);
+        if let Some(token) = auth_token {
+            command.env("OBSIDIAN_HTTP_AUTH_TOKEN", token);
+        }
+        let child = command.spawn().unwrap();
         let mut server = Self {
             child,
             vault,
@@ -423,6 +430,43 @@ async fn http_rejects_invalid_routing_headers_and_untrusted_hosts() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn http_requires_the_configured_bearer_token_on_mcp_only() {
+    const TOKEN: &str = "transport-test-token";
+    // `start_with` already proved /health answers without a token.
+    let server = HttpServer::start_with("full", "127.0.0.1", Some(TOKEN)).await;
+    for authorization in [
+        None,
+        Some("Bearer wrong-token"),
+        Some("Bearer transport-test-token-longer"),
+        Some("Basic transport-test-token"),
+        Some("transport-test-token"),
+    ] {
+        let mut request = server.request("server/discover", json!({}), MODERN);
+        if let Some(value) = authorization {
+            request = request.header("Authorization", value);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{authorization:?}"
+        );
+        assert_eq!(response.headers()["www-authenticate"], "Bearer");
+    }
+    let response = server
+        .request("server/discover", json!({}), MODERN)
+        .header("Authorization", format!("bearer {TOKEN}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        rpc_response(response).await["result"]["resultType"],
+        "complete"
+    );
     server.stop().await;
 }
 

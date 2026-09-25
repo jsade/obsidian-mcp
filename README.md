@@ -188,7 +188,7 @@ The `serve` command daemonizes the server and redirects logs to a platform-speci
 
 Default: `http://127.0.0.1:37842`. MCP tools are served at `/mcp`, health check at `/health`.
 
-The same MCP endpoint supports `server/discover` and stateless tool requests with protocol `2026-07-28`, plus the legacy `initialize` and session flow used by `2025-11-25` clients. Modern requests carry the protocol version and client metadata on each call. Reverse proxies must preserve MCP headers and forward an allowed loopback `Host` to the local server. A server bound to a specific non-loopback address (`--host 192.168.1.10`) also accepts that address as `Host`, so clients can connect to it directly. The HTTP transport has no authentication: bind to a non-loopback address only on a trusted network.
+The same MCP endpoint supports `server/discover` and stateless tool requests with protocol `2026-07-28`, plus the legacy `initialize` and session flow used by `2025-11-25` clients. Modern requests carry the protocol version and client metadata on each call. Reverse proxies must preserve MCP headers and forward an allowed loopback `Host` to the local server. A server bound to a specific non-loopback address (`--host 192.168.1.10`) also accepts that address as `Host`, so clients can connect to it directly. By default the HTTP transport has no authentication. Before binding to a non-loopback address, set `OBSIDIAN_HTTP_AUTH_TOKEN` so that every `/mcp` request must carry `Authorization: Bearer <token>`.
 
 Benefits over stdio for multi-agent setups:
 - **Shared index** — one in-memory BM25/embedding index instead of N copies
@@ -566,6 +566,7 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `OBSIDIAN_TRANSPORT` | No | `stdio` | Transport mode: `stdio` or `http` |
 | `OBSIDIAN_HTTP_PORT` | No | `37842` | HTTP listen port |
 | `OBSIDIAN_HTTP_HOST` | No | `127.0.0.1` | HTTP bind address |
+| `OBSIDIAN_HTTP_AUTH_TOKEN` | No | *(none)* | When set, every `/mcp` request must send `Authorization: Bearer <token>` (401 otherwise). `/health` stays open |
 | `OBSIDIAN_WATCH` | No | `true` | Filesystem watcher for live index updates |
 | `OBSIDIAN_LOG_LEVEL` | No | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `OBSIDIAN_TANTIVY` | No | `true` | BM25 full-text index |
