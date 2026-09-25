@@ -95,6 +95,7 @@ async fn serve_http(
     let mut mcp_config = StreamableHttpServerConfig::default();
     mcp_config.legacy_session_mode = true;
     mcp_config.json_response = true;
+    allow_bind_host(&mut mcp_config, config.http_host);
 
     let health_vault = vault.clone();
     let mcp_service: StreamableHttpService<ObsidianMcp, LocalSessionManager> =
@@ -138,6 +139,18 @@ async fn serve_http(
         .await?;
 
     Ok(())
+}
+
+/// rmcp accepts only loopback `Host` headers by default. A server bound to a
+/// specific non-loopback address must also accept that address, or it refuses
+/// every request that reaches it as a DNS rebinding attempt.
+fn allow_bind_host(
+    mcp_config: &mut rmcp::transport::StreamableHttpServerConfig,
+    bind: std::net::IpAddr,
+) {
+    if !bind.is_loopback() && !bind.is_unspecified() {
+        mcp_config.allowed_hosts.push(bind.to_string());
+    }
 }
 
 async fn tool_filter_middleware(
@@ -941,5 +954,22 @@ mod tests {
             runtime.daemon_unavailable_reason.as_deref(),
             Some(DAEMON_DISABLED_BY_WATCH_REASON)
         );
+    }
+
+    #[test]
+    fn allow_bind_host_adds_only_specific_non_loopback_addresses() {
+        use rmcp::transport::StreamableHttpServerConfig;
+        let defaults = StreamableHttpServerConfig::default().allowed_hosts;
+        for bind in ["127.0.0.1", "::1", "0.0.0.0", "::"] {
+            let mut mcp_config = StreamableHttpServerConfig::default();
+            allow_bind_host(&mut mcp_config, bind.parse().unwrap());
+            assert_eq!(mcp_config.allowed_hosts, defaults, "bind {bind}");
+        }
+        for bind in ["192.168.100.39", "fd00::1"] {
+            let mut mcp_config = StreamableHttpServerConfig::default();
+            allow_bind_host(&mut mcp_config, bind.parse().unwrap());
+            assert_eq!(mcp_config.allowed_hosts.last().unwrap(), bind);
+            assert_eq!(mcp_config.allowed_hosts.len(), defaults.len() + 1);
+        }
     }
 }

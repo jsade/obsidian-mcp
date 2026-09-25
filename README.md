@@ -188,7 +188,7 @@ The `serve` command daemonizes the server and redirects logs to a platform-speci
 
 Default: `http://127.0.0.1:37842`. MCP tools are served at `/mcp`, health check at `/health`.
 
-The same MCP endpoint supports `server/discover` and stateless tool requests with protocol `2026-07-28`, plus the legacy `initialize` and session flow used by `2025-11-25` clients. Modern requests carry the protocol version and client metadata on each call. Reverse proxies must preserve MCP headers and forward an allowed loopback `Host` to the local server.
+The same MCP endpoint supports `server/discover` and stateless tool requests with protocol `2026-07-28`, plus the legacy `initialize` and session flow used by `2025-11-25` clients. Modern requests carry the protocol version and client metadata on each call. Reverse proxies must preserve MCP headers and forward an allowed loopback `Host` to the local server. A server bound to a specific non-loopback address (`--host 192.168.1.10`) also accepts that address as `Host`, so clients can connect to it directly. The HTTP transport has no authentication: bind to a non-loopback address only on a trusted network.
 
 Benefits over stdio for multi-agent setups:
 - **Shared index** — one in-memory BM25/embedding index instead of N copies
