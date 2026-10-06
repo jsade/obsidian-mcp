@@ -1,9 +1,11 @@
 //! Path exclusion logic: compile glob patterns and test vault-relative paths.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use std::sync::Arc;
+
+use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::error::{VaultError, VaultResult};
 
@@ -21,6 +23,111 @@ pub(crate) fn is_visible_path(path: &Path) -> bool {
 pub struct ExcludeSet {
     set: GlobSet,
     patterns: Vec<String>,
+    /// Folder scope and the canonical vault root it is checked against.
+    scope: Option<(Arc<PathScope>, PathBuf)>,
+}
+
+/// Server-wide folder scope: the paths a client may reach at all.
+///
+/// Unlike [`ExcludeSet`], which only hides notes from indexing, a path outside
+/// the scope is refused by every `Vault` operation. Deny wins over allow, and
+/// an empty allow list allows everything that is not denied.
+///
+/// Matching ignores case and Unicode normalization form, because a
+/// case-insensitive filesystem serves `contract/x.md` from `Contract/`.
+/// Every pattern covers the entry it names and everything under it, so
+/// `Contract`, `Contract/` and `Contract/**` mean the same.
+pub struct PathScope {
+    deny: GlobSet,
+    allow: Option<GlobSet>,
+}
+
+impl PathScope {
+    /// A scope that permits every path.
+    pub fn unrestricted() -> Self {
+        Self {
+            deny: GlobSet::empty(),
+            allow: None,
+        }
+    }
+
+    /// Compile deny and allow patterns. The grammar is that of the exclude
+    /// list, except that a pattern also covers everything under the entry it
+    /// names, a leading `/` or `./` is dropped, and an invalid pattern is an
+    /// error: a scope that silently dropped a pattern would expose the folder
+    /// it named.
+    pub fn build(deny: &[String], allow: &[String]) -> VaultResult<Self> {
+        let deny = Self::compile(deny)?.unwrap_or_else(GlobSet::empty);
+        let allow = Self::compile(allow)?;
+        Ok(Self { deny, allow })
+    }
+
+    fn compile(patterns: &[String]) -> VaultResult<Option<GlobSet>> {
+        let mut builder = GlobSetBuilder::new();
+        let mut any = false;
+        for raw in patterns {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let pattern = Self::fold(trimmed)
+                .split('/')
+                .filter(|segment| !segment.is_empty() && *segment != ".")
+                .collect::<Vec<_>>()
+                .join("/");
+            let base = pattern.strip_suffix("/**").unwrap_or(&pattern);
+            if base.is_empty() || base == "**" {
+                return Err(VaultError::InvalidPath(format!(
+                    "scope pattern '{trimmed}' would cover the whole vault"
+                )));
+            }
+            let globs = [base.to_string(), format!("{base}/**")];
+            for glob in globs {
+                let compiled = GlobBuilder::new(&glob).build().map_err(|e| {
+                    VaultError::InvalidPath(format!("invalid scope pattern '{trimmed}': {e}"))
+                })?;
+                builder.add(compiled);
+                any = true;
+            }
+        }
+        if !any {
+            return Ok(None);
+        }
+        builder
+            .build()
+            .map(Some)
+            .map_err(|e| VaultError::Other(format!("glob set compile: {e}")))
+    }
+
+    /// True when no deny or allow pattern is configured.
+    pub fn is_unrestricted(&self) -> bool {
+        self.deny.is_empty() && self.allow.is_none()
+    }
+
+    /// Whether a vault-relative path matches a deny pattern.
+    pub fn denies(&self, relative_path: &Path) -> bool {
+        !self.deny.is_empty() && self.deny.is_match(Self::key(relative_path))
+    }
+
+    /// Whether a vault-relative path is inside the scope.
+    pub fn permits(&self, relative_path: &Path) -> bool {
+        if self.is_unrestricted() {
+            return true;
+        }
+        let key = Self::key(relative_path);
+        !self.deny.is_match(&key) && self.allow.as_ref().is_none_or(|allow| allow.is_match(&key))
+    }
+
+    fn key(relative_path: &Path) -> String {
+        Self::fold(&relative_path.to_string_lossy())
+    }
+
+    /// Case-folded, NFC-normalized, forward-slash spelling. globset's own
+    /// case-insensitive mode folds ASCII only, which would miss `Pöytäkirjat`.
+    fn fold(raw: &str) -> String {
+        let lowered = super::path::canonical_unicode_key(raw).to_lowercase();
+        super::path::canonical_unicode_key(&lowered).replace('\\', "/")
+    }
 }
 
 impl ExcludeSet {
@@ -62,11 +169,39 @@ impl ExcludeSet {
         Ok(Self {
             set,
             patterns: accepted,
+            scope: None,
         })
+    }
+
+    /// Also exclude every path outside `scope`, so that indexing, search,
+    /// graph and stats never see a scoped-out note. `vault_root` must be
+    /// canonical: a symlink is judged by where it points.
+    pub fn with_scope(mut self, scope: Arc<PathScope>, vault_root: &Path) -> Self {
+        self.scope = (!scope.is_unrestricted()).then(|| (scope, vault_root.to_path_buf()));
+        self
+    }
+
+    /// Whether a folder scope puts this path out of reach, under the name
+    /// given or under the location a symlink resolves to.
+    pub fn is_out_of_scope(&self, relative_path: &Path) -> bool {
+        let Some((scope, root)) = &self.scope else {
+            return false;
+        };
+        if !scope.permits(relative_path) {
+            return true;
+        }
+        root.join(relative_path)
+            .canonicalize()
+            .ok()
+            .and_then(|real| real.strip_prefix(root).map(Path::to_path_buf).ok())
+            .is_some_and(|real| !scope.permits(&real))
     }
 
     /// Check whether a vault-relative path is excluded.
     pub fn is_excluded(&self, relative_path: &Path) -> bool {
+        if self.is_out_of_scope(relative_path) {
+            return true;
+        }
         if self.is_empty() {
             return false;
         }
@@ -362,5 +497,93 @@ Resources/Meetings/
 
         let result = load_ignore_patterns(home.path(), data.path());
         assert_eq!(result, vec!["External/"]);
+    }
+
+    // ── PathScope ──
+
+    fn scope(deny: &[&str], allow: &[&str]) -> PathScope {
+        let owned = |patterns: &[&str]| patterns.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        PathScope::build(&owned(deny), &owned(allow)).unwrap()
+    }
+
+    #[test]
+    fn scope_unrestricted_permits_everything() {
+        let scope = scope(&[], &[]);
+        assert!(scope.is_unrestricted());
+        assert!(scope.permits(Path::new("Contract/wo.md")));
+    }
+
+    #[test]
+    fn scope_denies_folder_entry_and_everything_under_it() {
+        for pattern in [
+            "Contract",
+            "Contract/",
+            "Contract/**",
+            "/Contract/",
+            "./Contract//",
+        ] {
+            let scope = scope(&[pattern], &[]);
+            assert!(!scope.permits(Path::new("Contract")), "{pattern}");
+            assert!(!scope.permits(Path::new("Contract/wo.md")), "{pattern}");
+            assert!(
+                !scope.permits(Path::new("Contract/sub/deep.md")),
+                "{pattern}"
+            );
+            assert!(scope.permits(Path::new("Contracts/other.md")), "{pattern}");
+            assert!(scope.permits(Path::new("Notes/Contract.md")), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn scope_ignores_case_and_unicode_normalization_form() {
+        let scope = scope(&["Contract/", "Caf\u{e9}/", "p\u{f6}yt\u{e4}kirjat/"], &[]);
+        assert!(!scope.permits(Path::new("P\u{d6}YT\u{c4}KIRJAT/a.md")));
+        assert!(!scope.permits(Path::new("Po\u{308}yta\u{308}kirjat/a.md")));
+        assert!(!scope.permits(Path::new("contract/wo.md")));
+        assert!(!scope.permits(Path::new("CONTRACT/WO.MD")));
+        assert!(!scope.permits(Path::new("Cafe\u{301}/menu.md")));
+    }
+
+    #[test]
+    fn scope_allow_list_restricts_and_deny_wins() {
+        let scope = scope(&["Public/Drafts/"], &["Public/"]);
+        assert!(scope.permits(Path::new("Public/a.md")));
+        assert!(!scope.permits(Path::new("Public/Drafts/b.md")));
+        assert!(!scope.permits(Path::new("Private/c.md")));
+        assert!(!scope.permits(Path::new("root.md")));
+        assert!(!scope.denies(Path::new("Private/c.md")));
+        assert!(scope.denies(Path::new("Public/Drafts/b.md")));
+    }
+
+    #[test]
+    fn scope_rejects_an_invalid_pattern() {
+        for pattern in ["[bad", "/", "**", "./"] {
+            assert!(
+                PathScope::build(&[pattern.to_string()], &[]).is_err(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn scope_file_pattern_matches_the_file() {
+        let scope = scope(&["Notes/secret.md", "*.key"], &[]);
+        assert!(!scope.permits(Path::new("Notes/secret.md")));
+        assert!(!scope.permits(Path::new("Notes/Sub/id.KEY")));
+        assert!(scope.permits(Path::new("Notes/open.md")));
+    }
+
+    #[test]
+    fn exclude_set_with_scope_excludes_scoped_out_paths() {
+        let set = ExcludeSet::build(vec!["Archive/".into()])
+            .unwrap()
+            .with_scope(
+                Arc::new(scope(&["Contract/"], &[])),
+                Path::new("/nonexistent"),
+            );
+        assert!(set.is_excluded(Path::new("Contract/wo.md")));
+        assert!(set.is_excluded(Path::new("Archive/old.md")));
+        assert!(!set.is_excluded(Path::new("Notes/a.md")));
+        assert_eq!(set.patterns(), ["Archive/**"]);
     }
 }

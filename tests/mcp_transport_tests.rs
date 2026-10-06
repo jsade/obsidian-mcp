@@ -58,7 +58,23 @@ impl HttpServer {
     }
 
     async fn start_with(filter: &str, host: &str, auth_token: Option<&str>) -> Self {
+        let env: Vec<_> = auth_token
+            .map(|token| ("OBSIDIAN_HTTP_AUTH_TOKEN", token))
+            .into_iter()
+            .collect();
+        Self::start_custom(filter, host, &env, |_| {}).await
+    }
+
+    /// Start a server with extra environment, on a vault that `seed` fills
+    /// before the server indexes it.
+    async fn start_custom(
+        filter: &str,
+        host: &str,
+        env: &[(&str, &str)],
+        seed: impl FnOnce(&std::path::Path),
+    ) -> Self {
         let vault = temporary_vault();
+        seed(vault.path());
         let port = TcpListener::bind((host, 0))
             .unwrap()
             .local_addr()
@@ -68,9 +84,7 @@ impl HttpServer {
         command
             .args(["--http", "--host", host, "--port", &port.to_string()])
             .env("OBSIDIAN_TOOLS", filter);
-        if let Some(token) = auth_token {
-            command.env("OBSIDIAN_HTTP_AUTH_TOKEN", token);
-        }
+        command.envs(env.iter().copied());
         let child = command.spawn().unwrap();
         let mut server = Self {
             child,
@@ -175,6 +189,26 @@ impl HttpServer {
             .unwrap();
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         session
+    }
+
+    /// Call a tool and return the JSON-RPC message, whether a result or an
+    /// error (a refused call answers with a non-200 status).
+    async fn call(&self, name: &str, arguments: Value) -> Value {
+        let response = self
+            .request(
+                "tools/call",
+                json!({"name": name, "arguments": arguments}),
+                MODERN,
+            )
+            .send()
+            .await
+            .unwrap();
+        let body = response.text().await.unwrap();
+        let message = body
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or(&body);
+        serde_json::from_str(message).unwrap_or_else(|error| panic!("{error}: {body}"))
     }
 
     async fn stop(mut self) {
@@ -468,6 +502,255 @@ async fn http_requires_the_configured_bearer_token_on_mcp_only() {
         "complete"
     );
     server.stop().await;
+}
+
+const SECRET: &str = "TOPSECRET";
+const DENIED_NOTES: [&str; 3] = ["Contract/wo.md", "People/staff.md", "Minutes/m1.md"];
+
+fn seed_scoped_vault(root: &std::path::Path) {
+    for path in DENIED_NOTES {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            file,
+            format!(
+                "---\ntags: [classified]\nstatus: sealed\n---\n# Sealed\n{SECRET} zebra [[public]]\n"
+            ),
+        )
+        .unwrap();
+    }
+    std::fs::create_dir_all(root.join("Open")).unwrap();
+    std::fs::write(
+        root.join("Open/public.md"),
+        "---\ntags: [classified]\nstatus: sealed\n---\n# Public\nzebra [[wo]]\n",
+    )
+    .unwrap();
+}
+
+fn denied_tree(root: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+    let mut files = Vec::new();
+    for folder in ["Contract", "People", "Minutes"] {
+        for entry in std::fs::read_dir(root.join(folder)).unwrap() {
+            let path = entry.unwrap().path();
+            let content = std::fs::read_to_string(&path).unwrap();
+            files.push((path, content));
+        }
+    }
+    files.sort();
+    files
+}
+
+fn is_refused(response: &Value) -> bool {
+    response.get("error").is_some() || response["result"]["isError"] == true
+}
+
+#[tokio::test]
+async fn denied_folders_are_out_of_reach_of_every_tool() {
+    let server = HttpServer::start_custom(
+        "full",
+        "127.0.0.1",
+        &[("OBSIDIAN_DENY_PATHS", "Contract/,People/,Minutes/")],
+        seed_scoped_vault,
+    )
+    .await;
+    let before = denied_tree(server.vault.path());
+    assert_eq!(before.len(), 3);
+
+    // Control: without this, a server that refused everything would pass.
+    let read = server
+        .call("note_read", json!({"path": "Open/public.md"}))
+        .await;
+    assert!(!is_refused(&read), "{read}");
+    let found = server.call("search_text", json!({"query": "zebra"})).await;
+    assert!(found.to_string().contains("Open/public.md"), "{found}");
+
+    // Addressing a denied note directly, in its own and in another spelling.
+    let mut targets: Vec<String> = DENIED_NOTES.iter().map(|path| path.to_string()).collect();
+    targets.push("contract/WO.md".into());
+    targets.push("Open/../Contract/wo.md".into());
+    for path in &targets {
+        let calls = [
+            ("note_read", json!({"path": path})),
+            (
+                "note_write",
+                json!({"path": path, "content": "overwritten"}),
+            ),
+            ("note_insert", json!({"path": path, "content": "inserted"})),
+            (
+                "note_patch",
+                json!({
+                    "path": path, "operation": "append", "target_type": "heading",
+                    "target": "Sealed", "content": "patched"
+                }),
+            ),
+            ("note_delete", json!({"path": path, "confirm": true})),
+            ("note_inspect", json!({"path": path})),
+            ("note_inspect", json!({"path": path, "view": "targets"})),
+            ("frontmatter", json!({"action": "get", "path": path})),
+            (
+                "frontmatter",
+                json!({"action": "set", "path": path, "key": "status", "value": "open"}),
+            ),
+            (
+                "frontmatter",
+                json!({"action": "remove", "path": path, "key": "status"}),
+            ),
+            ("wikilinks", json!({"query": "backlinks", "path": path})),
+            ("wikilinks", json!({"query": "outgoing", "path": path})),
+            ("note_move", json!({"from": path, "to": "Open/taken.md"})),
+            ("note_move", json!({"from": "Open/public.md", "to": path})),
+        ];
+        for (tool, arguments) in calls {
+            let response = server.call(tool, arguments.clone()).await;
+            assert!(is_refused(&response), "{tool} {arguments}: {response}");
+            assert!(
+                !response.to_string().contains(SECRET),
+                "{tool} {arguments}: {response}"
+            );
+        }
+        let many = server
+            .call("note_read_many", json!({"paths": [path]}))
+            .await;
+        assert!(!many.to_string().contains(SECRET), "{path}: {many}");
+    }
+    for path in ["Contract/new.md", "contract/new.md", "People/sub/new.md"] {
+        let response = server
+            .call("note_create", json!({"path": path, "content": "planted"}))
+            .await;
+        assert!(is_refused(&response), "{path}: {response}");
+    }
+    for folder in ["Contract", "contract", "People", "Minutes"] {
+        for (tool, arguments) in [
+            ("vault_list", json!({"path": folder})),
+            ("note_read_many", json!({"dir": folder})),
+        ] {
+            let response = server.call(tool, arguments.clone()).await;
+            assert!(is_refused(&response), "{tool} {arguments}: {response}");
+        }
+    }
+
+    // Side doors: hidden folders hold copies of deleted notes, and a folder
+    // rename would carry a denied subfolder to a new name.
+    std::fs::create_dir_all(server.vault.path().join(".trash/Contract")).unwrap();
+    std::fs::write(server.vault.path().join(".trash/Contract/wo.md"), SECRET).unwrap();
+    for (tool, arguments) in [
+        ("note_read", json!({"path": ".trash/Contract/wo.md"})),
+        ("vault_list", json!({"path": ".trash", "recursive": true})),
+        (
+            "note_read_many",
+            json!({"dir": ".trash", "recursive": true}),
+        ),
+        (
+            "note_write",
+            json!({"path": ".obsidian/daily-notes.json", "content": "{}"}),
+        ),
+        ("note_move", json!({"from": "Open", "to": "Renamed"})),
+    ] {
+        let response = server.call(tool, arguments.clone()).await;
+        assert!(is_refused(&response), "{tool} {arguments}: {response}");
+        assert!(!response.to_string().contains(SECRET), "{tool}: {response}");
+    }
+
+    // Finding a denied note without naming it.
+    let finders = [
+        ("vault_list", json!({"recursive": true})),
+        (
+            "vault_list",
+            json!({"recursive": true, "include_metadata": true}),
+        ),
+        ("vault_list", json!({"format": "tree"})),
+        ("note_read_many", json!({"dir": "", "recursive": true})),
+        ("search_text", json!({"query": "zebra"})),
+        ("search_text", json!({"query": SECRET})),
+        ("search_regex", json!({"pattern": "TOPSECRET|zebra"})),
+        (
+            "search_metadata",
+            json!({"type": "tag", "tag": "classified"}),
+        ),
+        (
+            "search_metadata",
+            json!({"type": "frontmatter", "field": "status", "value": "sealed"}),
+        ),
+        (
+            "wikilinks",
+            json!({"query": "backlinks", "path": "Open/public.md"}),
+        ),
+        ("wikilinks", json!({"query": "broken"})),
+        ("wikilinks", json!({"query": "orphans"})),
+    ];
+    for (tool, arguments) in finders {
+        let response = server.call(tool, arguments.clone()).await;
+        assert!(!is_refused(&response), "{tool} {arguments}: {response}");
+        let text = response.to_string();
+        for leak in [
+            SECRET, "wo.md", "staff.md", "m1.md", "Contract", "People", "Minutes",
+        ] {
+            assert!(
+                !text.contains(leak),
+                "{tool} {arguments} leaks {leak}: {text}"
+            );
+        }
+    }
+
+    assert_eq!(denied_tree(server.vault.path()), before);
+    assert!(server.vault.path().join("Open/public.md").is_file());
+    assert!(!server.vault.path().join("Open/taken.md").exists());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn allow_list_limits_the_server_to_the_listed_folders() {
+    let server = HttpServer::start_custom(
+        "full",
+        "127.0.0.1",
+        &[("OBSIDIAN_ALLOW_PATHS", "Open/")],
+        seed_scoped_vault,
+    )
+    .await;
+    let read = server
+        .call("note_read", json!({"path": "Open/public.md"}))
+        .await;
+    assert!(!is_refused(&read), "{read}");
+    for path in ["Contract/wo.md", "note.md"] {
+        let read = server.call("note_read", json!({"path": path})).await;
+        assert!(is_refused(&read), "{path}: {read}");
+    }
+    let created = server
+        .call(
+            "note_create",
+            json!({"path": "elsewhere.md", "content": "x"}),
+        )
+        .await;
+    assert!(is_refused(&created), "{created}");
+    let found = server
+        .call("search_text", json!({"query": "zebra"}))
+        .await
+        .to_string();
+    assert!(
+        found.contains("Open/public.md") && !found.contains("wo.md"),
+        "{found}"
+    );
+    let listed = server
+        .call("vault_list", json!({"recursive": true}))
+        .await
+        .to_string();
+    assert!(
+        listed.contains("Open/public.md") && !listed.contains("note.md"),
+        "{listed}"
+    );
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_invalid_scope_pattern_stops_the_server() {
+    let vault = temporary_vault();
+    let status = server_command(&vault)
+        .env("OBSIDIAN_DENY_PATHS", "Contract/,[bad")
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .unwrap();
+    assert!(!status.success());
 }
 
 #[tokio::test]

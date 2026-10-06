@@ -40,6 +40,9 @@ pub enum VaultError {
     #[error("Invalid vault path: {0} is outside vault root")]
     OutsideVault(PathBuf),
 
+    #[error("Access denied: {0} is outside the paths this server exposes")]
+    AccessDenied(PathBuf),
+
     #[error("Invalid regex pattern '{pattern}': {source}")]
     InvalidRegex {
         pattern: String,
@@ -97,6 +100,7 @@ impl From<VaultError> for rmcp::ErrorData {
             }
             VaultError::InvalidPath(_)
             | VaultError::OutsideVault(_)
+            | VaultError::AccessDenied(_)
             | VaultError::AlreadyExists(_)
             | VaultError::InvalidFrontmatter { .. }
             | VaultError::PatchTargetNotFound { .. }

@@ -53,7 +53,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "semantic runtime configured"
     );
 
-    let vault = Vault::open(&config).await?;
+    obsidian_mcp::config::warn_on_misnamed_scope_env();
+    let scope = obsidian_mcp::config::PathScopeConfig::from_env();
+    let scope = obsidian_mcp::vault::exclude::PathScope::build(&scope.deny, &scope.allow)?;
+    let vault = Vault::open_scoped(&config, scope).await?;
     let disabled_tools = config.tool_filter.disabled_tools();
 
     match config.transport {
@@ -469,7 +472,9 @@ fn print_help() {
              OBSIDIAN_TOOLS          Tool filter: profile (full/core/read/minimal),\n    \
                                      comma-separated allow-list, or !-prefixed deny-list\n    \
              OBSIDIAN_MCP_DATA       External data dir for embeddings  [default: {{vault}}/.obsidian-mcp]\n    \
-             OBSIDIAN_EXCLUDE_PATHS  Comma-separated exclusion globs   [default: none]",
+             OBSIDIAN_EXCLUDE_PATHS  Comma-separated exclusion globs   [default: none]\n    \
+             OBSIDIAN_DENY_PATHS     Folders no tool may reach         [default: none]\n    \
+             OBSIDIAN_ALLOW_PATHS    Only these folders are reachable  [default: all]",
         name = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),

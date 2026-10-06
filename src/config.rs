@@ -384,12 +384,7 @@ impl Config {
 
         let mcp_data_dir = normalize_optional_path_env("OBSIDIAN_MCP_DATA");
 
-        let exclude_patterns: Vec<String> = std::env::var("OBSIDIAN_EXCLUDE_PATHS")
-            .unwrap_or_default()
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
+        let exclude_patterns = comma_list_env("OBSIDIAN_EXCLUDE_PATHS");
 
         Ok(Self {
             vault_path,
@@ -620,6 +615,51 @@ fn strip_matching_outer_quotes(mut value: &str) -> &str {
             continue;
         }
         return value;
+    }
+}
+
+/// Comma-separated list from an environment variable; blank entries dropped.
+fn comma_list_env(name: &str) -> Vec<String> {
+    std::env::var(name)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Folder scope patterns from `OBSIDIAN_DENY_PATHS` and `OBSIDIAN_ALLOW_PATHS`.
+///
+/// Kept out of [`Config`]: unlike the exclude list, these bound what any
+/// client may reach, and they are handed to `Vault::open_scoped` directly.
+pub struct PathScopeConfig {
+    pub deny: Vec<String>,
+    pub allow: Vec<String>,
+}
+
+/// A misspelt scope variable (`OBSIDIAN_DENY_PATH`) would leave the vault
+/// open without a sign; say so at startup.
+pub fn warn_on_misnamed_scope_env() {
+    for (key, _) in std::env::vars_os() {
+        let key = key.to_string_lossy();
+        if (key.starts_with("OBSIDIAN_DENY") || key.starts_with("OBSIDIAN_ALLOW"))
+            && key != "OBSIDIAN_DENY_PATHS"
+            && key != "OBSIDIAN_ALLOW_PATHS"
+        {
+            tracing::warn!(
+                variable = %key,
+                "unknown folder scope variable ignored; use OBSIDIAN_DENY_PATHS or OBSIDIAN_ALLOW_PATHS"
+            );
+        }
+    }
+}
+
+impl PathScopeConfig {
+    pub fn from_env() -> Self {
+        Self {
+            deny: comma_list_env("OBSIDIAN_DENY_PATHS"),
+            allow: comma_list_env("OBSIDIAN_ALLOW_PATHS"),
+        }
     }
 }
 
