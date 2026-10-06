@@ -204,6 +204,51 @@ obsidian-mcp --http --port 9000 --host 0.0.0.0 /path/to/vault
 OBSIDIAN_TRANSPORT=http OBSIDIAN_HTTP_PORT=9000 obsidian-mcp /path/to/vault
 ```
 
+### Exposing the HTTP endpoint
+
+By default the endpoint answers only requests whose `Host` header is a loopback name or the bind address, and it has no authentication. To put it behind a public name or a tunnel, set these three things. The server speaks plain HTTP, so terminate TLS in the tunnel or reverse proxy in front of it.
+
+**Host names.** An authenticated `/mcp` request whose `Host` is not on the list gets 403. Because a public name opens the endpoint to other hosts, the server refuses to start with `OBSIDIAN_HTTP_ALLOWED_HOSTS` set and no token configured.
+
+```sh
+OBSIDIAN_HTTP_ALLOWED_HOSTS="vault.example.com" obsidian-mcp --http /path/to/vault
+```
+
+**Named tokens.** Give each client its own token, so one can be revoked without changing the others. The token file holds a name and the SHA-256 of the token, never the token itself:
+
+```sh
+TOKEN="$(openssl rand -hex 32)"      # hand this to the client, out of band
+printf 'laptop:%s\n' "$(printf %s "$TOKEN" | shasum -a 256 | cut -d' ' -f1)" >> /path/to/tokens
+OBSIDIAN_HTTP_AUTH_TOKENS_FILE=/path/to/tokens obsidian-mcp --http /path/to/vault
+```
+
+- A name uses letters, digits, `-`, `_` and `.`. Lines starting with `#` are comments.
+- To revoke a client, delete its line. The server reads the file on every request, so the next request with that token is refused and the other clients keep their sessions. No restart is needed. To add a client, add a line.
+- If the file cannot be read or has a bad line, none of its tokens is accepted until it is repaired, and the log says why (at `error` level). At startup a missing or bad file stops the server. Two lines may not share a name or a token.
+- A session belongs to the token that opened it. Another token that presents its session id gets 403.
+- `OBSIDIAN_HTTP_AUTH_TOKEN` still works, alone or beside the file. It appears in the write log under the name `default`. The file may not use the names `default`, `anonymous` or `stdio`. Changing or removing this token needs a restart.
+- Keep the token file outside the vault, readable only by the server's user.
+
+**Write log.** Every call that changes the vault writes one line to the log (stderr), whatever `OBSIDIAN_LOG_LEVEL` is:
+
+```text
+2026-10-06T10:58:21.035235Z  INFO obsidian_mcp::write_log: write client=laptop tool="note_move" path="Notes/a.md" to="Notes/b.md" outcome="ok"
+```
+
+- `client` is the token name (`default` for `OBSIDIAN_HTTP_AUTH_TOKEN`, `anonymous` when no token is configured, `stdio` for the stdio transport).
+- `tool` is one of `note_create`, `note_write`, `note_insert`, `note_patch`, `note_delete`, `note_move`, `frontmatter` (set and remove) and `periodic` (create). `path` is the path the client asked for.
+- `outcome` is `ok` or `error`. Failed writes and writes the folder scope refuses are logged too. A call that never reaches the tool is not: a tool switched off with `OBSIDIAN_TOOLS`, or arguments the tool cannot parse.
+- `path` and `to` are cut at 512 characters.
+
+Before you expose a server:
+
+- Route only `/mcp` through the tunnel or proxy. `/health` answers without a token and without the `Host` check, and shows the version, the note count and the embedding status.
+- Limit request rates in the tunnel or proxy. The server does not.
+- Keep `OBSIDIAN_LOG_LEVEL` at `info` or quieter. At `debug`, the log holds full tool arguments, note text included.
+- Switch off the tools the clients do not need, for example `OBSIDIAN_TOOLS='!open_in_obsidian'`, which would open the Obsidian app on the server's machine.
+
+To limit which folders a client can reach at all, see [Folder scope](#folder-scope).
+
 ### Server Management
 
 ```sh
@@ -567,6 +612,8 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `OBSIDIAN_HTTP_PORT` | No | `37842` | HTTP listen port |
 | `OBSIDIAN_HTTP_HOST` | No | `127.0.0.1` | HTTP bind address |
 | `OBSIDIAN_HTTP_AUTH_TOKEN` | No | *(none)* | When set, every `/mcp` request must send `Authorization: Bearer <token>` (401 otherwise). `/health` stays open |
+| `OBSIDIAN_HTTP_AUTH_TOKENS_FILE` | No | *(none)* | File of named tokens, one `name:sha256-hex` per line. Removing a line revokes that token without a restart. See [Exposing the HTTP endpoint](#exposing-the-http-endpoint) |
+| `OBSIDIAN_HTTP_ALLOWED_HOSTS` | No | *(none)* | Comma-separated extra `Host` names to accept, for a public name or a tunnel: `vault.example.com` (any port) or `vault.example.com:8443` |
 | `OBSIDIAN_WATCH` | No | `true` | Filesystem watcher for live index updates |
 | `OBSIDIAN_LOG_LEVEL` | No | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `OBSIDIAN_TANTIVY` | No | `true` | BM25 full-text index |
