@@ -314,7 +314,8 @@ impl Vault {
             self.guard(dir)?;
         }
         let mut files = fs::list_files(&self.inner.root, dir, recursive, glob)?;
-        files.retain(|path| scope.permits(path));
+        // A symlink entry is judged by where it points.
+        files.retain(|path| !self.inner.exclude.is_out_of_scope(path));
         Ok(files)
     }
 
@@ -2416,6 +2417,24 @@ mod tests {
         )
         .unwrap();
         assert!(vault.inner.exclude.is_excluded(Path::new("Open/alias.md")));
+        // A trashed copy is as out of reach as the folder it came from.
+        std::fs::create_dir_all(dir.path().join(".trash")).unwrap();
+        std::fs::write(dir.path().join(".trash/old.md"), "deleted").unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join(".trash/old.md"),
+            dir.path().join("Open/trashed.md"),
+        )
+        .unwrap();
+        assert!(
+            vault
+                .inner
+                .exclude
+                .is_excluded(Path::new("Open/trashed.md"))
+        );
+        assert_eq!(
+            vault.list_files(Path::new("Open"), false, None).unwrap(),
+            [PathBuf::from("Open/a.md")]
+        );
         assert!(!vault.inner.exclude.is_excluded(Path::new("Open/a.md")));
     }
 

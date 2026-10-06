@@ -70,11 +70,16 @@ impl PathScope {
             if trimmed.is_empty() {
                 continue;
             }
-            let pattern = Self::fold(trimmed)
+            let pattern = Self::fold_case(trimmed)
                 .split('/')
                 .filter(|segment| !segment.is_empty() && *segment != ".")
                 .collect::<Vec<_>>()
                 .join("/");
+            if pattern.split('/').any(|segment| segment == "..") {
+                return Err(VaultError::InvalidPath(format!(
+                    "scope pattern '{trimmed}' must not contain '..'"
+                )));
+            }
             let base = pattern.strip_suffix("/**").unwrap_or(&pattern);
             if base.is_empty() || base == "**" {
                 return Err(VaultError::InvalidPath(format!(
@@ -119,14 +124,18 @@ impl PathScope {
     }
 
     fn key(relative_path: &Path) -> String {
-        Self::fold(&relative_path.to_string_lossy())
+        Self::fold_case(&relative_path.to_string_lossy()).replace('\\', "/")
     }
 
-    /// Case-folded, NFC-normalized, forward-slash spelling. globset's own
-    /// case-insensitive mode folds ASCII only, which would miss `Pöytäkirjat`.
-    fn fold(raw: &str) -> String {
-        let lowered = super::path::canonical_unicode_key(raw).to_lowercase();
-        super::path::canonical_unicode_key(&lowered).replace('\\', "/")
+    /// Case-folded, NFC-normalized spelling, applied to patterns and paths
+    /// alike. globset's own case-insensitive mode folds ASCII only, which
+    /// would miss `Pöytäkirjat`. Upper-casing first also folds the letters
+    /// that lower-casing alone leaves apart (`ſ` and `s`, `ς` and `σ`).
+    fn fold_case(raw: &str) -> String {
+        let folded = super::path::canonical_unicode_key(raw)
+            .to_uppercase()
+            .to_lowercase();
+        super::path::canonical_unicode_key(&folded)
     }
 }
 
@@ -194,7 +203,7 @@ impl ExcludeSet {
             .canonicalize()
             .ok()
             .and_then(|real| real.strip_prefix(root).map(Path::to_path_buf).ok())
-            .is_some_and(|real| !scope.permits(&real))
+            .is_some_and(|real| !is_visible_path(&real) || !scope.permits(&real))
     }
 
     /// Check whether a vault-relative path is excluded.
@@ -557,12 +566,26 @@ Resources/Meetings/
 
     #[test]
     fn scope_rejects_an_invalid_pattern() {
-        for pattern in ["[bad", "/", "**", "./"] {
+        for pattern in ["[bad", "/", "**", "./", "Notes/../Private/"] {
             assert!(
                 PathScope::build(&[pattern.to_string()], &[]).is_err(),
                 "{pattern}"
             );
         }
+    }
+
+    #[test]
+    fn scope_keeps_escaped_glob_characters_literal() {
+        let scope = scope(&[r"Projects \[2024\]/"], &[]);
+        assert!(!scope.permits(Path::new("Projects [2024]/x.md")));
+        assert!(scope.permits(Path::new("Projects 2/x.md")));
+    }
+
+    #[test]
+    fn scope_folds_letters_that_lowercasing_leaves_apart() {
+        let scope = scope(&["Minutes/", "Stra\u{df}e/"], &[]);
+        assert!(!scope.permits(Path::new("Minute\u{17f}/new.md")));
+        assert!(!scope.permits(Path::new("STRASSE/a.md")));
     }
 
     #[test]

@@ -609,7 +609,7 @@ OBSIDIAN_DENY_PATHS="Private/,Clients/Contracts/" obsidian-mcp --http
 ```
 
 - `OBSIDIAN_DENY_PATHS` lists folders no tool may touch. `OBSIDIAN_ALLOW_PATHS`, when set, limits the server to the listed folders. Deny wins over allow.
-- The patterns are globs relative to the vault root. A pattern covers the entry it names and everything under it, so `Private`, `Private/` and `Private/**` mean the same. A leading `/` or `./` is dropped.
+- The patterns are globs relative to the vault root. A pattern covers the entry it names and everything under it, so `Private`, `Private/` and `Private/**` mean the same. A leading `/` or `./` is dropped. `*`, `?`, `[`, `]`, `{` and `}` are glob characters: write `\\[` to mean a literal bracket in a folder name.
 - Every tool obeys the scope. A path outside it is refused with `Access denied`, whether or not the note exists. Scoped-out notes are not indexed, so search, tags, links, orphans, listings and the file counts in `vault_info` do not include them.
 - Matching ignores case and Unicode normalization form, and follows symlinks, so `private/x.md` and a symlink into `Private/` are refused too.
 - While a scope is set, hidden folders such as `.obsidian` and `.trash` are out of reach as well. They hold deleted notes and the names of recently opened notes from every folder.

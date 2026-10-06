@@ -116,7 +116,8 @@ impl HttpServer {
                     assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
                     break;
                 }
-                Err(error) if error.is_connect() && Instant::now() < deadline => {
+                // A connection can also be reset while the server is still starting.
+                Err(_) if Instant::now() < deadline => {
                     sleep(Duration::from_millis(25)).await;
                 }
                 Err(error) => panic!("server health probe failed: {error}"),
