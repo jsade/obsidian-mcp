@@ -35,6 +35,24 @@ fn server_command(vault: &TempDir) -> Command {
     command
 }
 
+/// A free port that no other test in this process was given: the system can
+/// hand the same port to two tests that ask before either server binds it.
+fn free_port(host: &str) -> u16 {
+    static TAKEN: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+    loop {
+        let port = TcpListener::bind((host, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut taken = TAKEN.lock().unwrap();
+        if !taken.contains(&port) {
+            taken.push(port);
+            return port;
+        }
+    }
+}
+
 fn temporary_vault() -> TempDir {
     let vault = tempfile::tempdir().unwrap();
     std::fs::write(vault.path().join("note.md"), NOTE).unwrap();
@@ -75,11 +93,7 @@ impl HttpServer {
     ) -> Self {
         let vault = temporary_vault();
         seed(vault.path());
-        let port = TcpListener::bind((host, 0))
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = free_port(host);
         let mut command = server_command(&vault);
         command
             .args(["--http", "--host", host, "--port", &port.to_string()])
