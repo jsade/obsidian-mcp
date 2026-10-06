@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = parse_cli_args();
     let config = Config::load(&cli)?;
-    let semantic_runtime_config = SemanticRuntimeConfig::load_from_env();
+    let mut semantic_runtime_config = SemanticRuntimeConfig::load_from_env();
 
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(&config.log_level))
@@ -46,6 +46,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "starting obsidian-mcp"
     );
 
+    obsidian_mcp::config::warn_on_misnamed_scope_env();
+    let scope = obsidian_mcp::config::PathScopeConfig::from_env();
+    let scope = obsidian_mcp::vault::exclude::PathScope::build(&scope.deny, &scope.allow)?;
+    // The semantic daemon indexes and embeds the whole vault on its own, so a
+    // scoped server must not attach the vault to it.
+    if !scope.is_unrestricted() && semantic_runtime_config.mode != SemanticMode::Local {
+        tracing::warn!(
+            "folder scope is set: semantic daemon disabled, using OBSIDIAN_SEMANTIC_MODE=local"
+        );
+        semantic_runtime_config.mode = SemanticMode::Local;
+    }
+
     let semantic_runtime = init_semantic_runtime(&config, &semantic_runtime_config).await;
     tracing::info!(
         semantic_mode = semantic_runtime.mode.as_str(),
@@ -53,9 +65,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "semantic runtime configured"
     );
 
-    obsidian_mcp::config::warn_on_misnamed_scope_env();
-    let scope = obsidian_mcp::config::PathScopeConfig::from_env();
-    let scope = obsidian_mcp::vault::exclude::PathScope::build(&scope.deny, &scope.allow)?;
     let vault = Vault::open_scoped(&config, scope).await?;
     let disabled_tools = config.tool_filter.disabled_tools();
 

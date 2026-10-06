@@ -609,13 +609,14 @@ OBSIDIAN_DENY_PATHS="Private/,Clients/Contracts/" obsidian-mcp --http
 ```
 
 - `OBSIDIAN_DENY_PATHS` lists folders no tool may touch. `OBSIDIAN_ALLOW_PATHS`, when set, limits the server to the listed folders. Deny wins over allow.
-- The patterns are globs relative to the vault root. A pattern covers the entry it names and everything under it, so `Private`, `Private/` and `Private/**` mean the same. A leading `/` or `./` is dropped. `*`, `?`, `[`, `]`, `{` and `}` are glob characters: write `\\[` to mean a literal bracket in a folder name.
+- The patterns are globs relative to the vault root. A pattern covers the entry it names and everything under it, so `Private`, `Private/` and `Private/**` mean the same. A leading `/` or `./` is dropped. `*`, `?`, `[`, `]`, `{` and `}` are glob characters: write `\\[` to mean a literal bracket in a folder name. `*` also matches `/`, so `*.key` covers that file type in every folder.
 - Every tool obeys the scope. A path outside it is refused with `Access denied`, whether or not the note exists. Scoped-out notes are not indexed, so search, tags, links, orphans, listings and the file counts in `vault_info` do not include them.
 - Matching ignores case and Unicode normalization form, and follows symlinks, so `private/x.md` and a symlink into `Private/` are refused too.
 - While a scope is set, hidden folders such as `.obsidian` and `.trash` are out of reach as well. They hold deleted notes and the names of recently opened notes from every folder.
 - While a scope is set, `note_move` moves notes only, not folders. A move is refused when either end is outside the scope.
 - With an allow list, only the vault root and the allowed folders can be listed. A listing of the root shows only what is allowed.
-- An invalid pattern, or one that would cover the whole vault, stops the server at startup. A misspelt variable name such as `OBSIDIAN_DENY_PATH` is reported in the log, because it would otherwise leave the vault open.
+- While a scope is set, semantic search runs in `OBSIDIAN_SEMANTIC_MODE=local`, whatever that setting says. The shared semantic daemon reads and embeds every note in a vault, so the server does not attach the vault to it. A build without the `embeddings` feature has no semantic search while a scope is set. If the daemon indexed this vault before the scope was set, its cache still holds the old embeddings: delete that cache.
+- An invalid pattern, or one that would cover the whole vault (`*`, `**`, `*.md`), stops the server at startup. A misspelt variable name such as `OBSIDIAN_DENY_PATH` is reported in the log, because it would otherwise leave the vault open.
 - `vault_info` does not show the scope patterns. Its `excluded_notes` count includes scoped-out notes.
 - The scope applies to the whole server. Restart after changing it.
 - The scope covers what the server does. A symlink or hard link that another program creates inside an allowed folder is outside its control: a symlink is checked by where it points, a hard link cannot be told apart from an ordinary file.

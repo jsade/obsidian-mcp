@@ -42,6 +42,15 @@ pub struct PathScope {
     allow: Option<GlobSet>,
 }
 
+/// Paths no pattern that names a folder or a file would match. A pattern that
+/// matches one of them covers every note in the vault.
+const WHOLE_VAULT_PROBES: [&str; 4] = [
+    "\u{e000}",
+    "\u{e000}/\u{e001}",
+    "\u{e000}.md",
+    "\u{e000}/\u{e001}.md",
+];
+
 impl PathScope {
     /// A scope that permits every path.
     pub fn unrestricted() -> Self {
@@ -91,6 +100,16 @@ impl PathScope {
                 let compiled = GlobBuilder::new(&glob).build().map_err(|e| {
                     VaultError::InvalidPath(format!("invalid scope pattern '{trimmed}': {e}"))
                 })?;
+                // `*` crosses `/`, so `*`, `*/**` or `*.md` name no folder at all.
+                let matcher = compiled.compile_matcher();
+                if WHOLE_VAULT_PROBES
+                    .iter()
+                    .any(|probe| matcher.is_match(probe))
+                {
+                    return Err(VaultError::InvalidPath(format!(
+                        "scope pattern '{trimmed}' would cover the whole vault"
+                    )));
+                }
                 builder.add(compiled);
                 any = true;
             }
@@ -569,6 +588,35 @@ Resources/Meetings/
         for pattern in ["[bad", "/", "**", "./", "Notes/../Private/"] {
             assert!(
                 PathScope::build(&[pattern.to_string()], &[]).is_err(),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn scope_rejects_a_wildcard_that_covers_the_whole_vault() {
+        for pattern in [
+            "*",
+            "*/",
+            "*/**",
+            "**/*",
+            "?*",
+            "*.md",
+            "**/*.md",
+            "{*,Private}",
+        ] {
+            assert!(
+                PathScope::build(&[], &[pattern.to_string()]).is_err(),
+                "allow {pattern}"
+            );
+            assert!(
+                PathScope::build(&[pattern.to_string()], &[]).is_err(),
+                "deny {pattern}"
+            );
+        }
+        for pattern in ["Notes/*", "*.key", "*draft*", "Clients/*/Contracts/"] {
+            assert!(
+                PathScope::build(&[], &[pattern.to_string()]).is_ok(),
                 "{pattern}"
             );
         }

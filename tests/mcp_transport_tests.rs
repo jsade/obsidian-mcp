@@ -91,15 +91,37 @@ impl HttpServer {
         env: &[(&str, &str)],
         seed: impl FnOnce(&std::path::Path),
     ) -> Self {
+        Self::start_logging_to(filter, host, env, seed, None).await
+    }
+
+    /// As `start_custom`, with the server's log appended to the file `log`.
+    async fn start_logging_to(
+        filter: &str,
+        host: &str,
+        env: &[(&str, &str)],
+        seed: impl FnOnce(&std::path::Path),
+        log: Option<&std::path::Path>,
+    ) -> Self {
         let vault = temporary_vault();
         seed(vault.path());
-        let port = free_port(host);
-        let mut command = server_command(&vault);
-        command
-            .args(["--http", "--host", host, "--port", &port.to_string()])
-            .env("OBSIDIAN_TOOLS", filter);
-        command.envs(env.iter().copied());
-        let child = command.spawn().unwrap();
+        let spawn = |vault: &TempDir| {
+            let port = free_port(host);
+            let mut command = server_command(vault);
+            command
+                .args(["--http", "--host", host, "--port", &port.to_string()])
+                .env("OBSIDIAN_TOOLS", filter)
+                .envs(env.iter().copied());
+            if let Some(log) = log {
+                let log = std::fs::File::options().create(true).append(true).open(log);
+                command.stderr(log.unwrap());
+            }
+            let url = format!(
+                "http://{}",
+                std::net::SocketAddr::new(host.parse().unwrap(), port)
+            );
+            (command.spawn().unwrap(), url)
+        };
+        let (child, url) = spawn(&vault);
         let mut server = Self {
             child,
             vault,
@@ -108,14 +130,18 @@ impl HttpServer {
                 .timeout(Duration::from_secs(10))
                 .build()
                 .unwrap(),
-            url: format!(
-                "http://{}",
-                std::net::SocketAddr::new(host.parse().unwrap(), port)
-            ),
+            url,
         };
         let deadline = Instant::now() + Duration::from_secs(15);
+        let mut respawns = 0;
         loop {
-            assert!(server.child.try_wait().unwrap().is_none(), "server exited");
+            // The port can be taken between choosing it and the server binding
+            // it, for one by another test's outgoing connection.
+            if server.child.try_wait().unwrap().is_some() {
+                respawns += 1;
+                assert!(respawns <= 5, "server exited");
+                (server.child, server.url) = spawn(&server.vault);
+            }
             match server
                 .client
                 .get(format!("{}/health", server.url))
@@ -1120,4 +1146,28 @@ async fn stop_uses_the_configured_ipv6_host_from_cli_and_environment() {
                 .is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn a_scoped_server_stays_off_the_semantic_daemon() {
+    let logs = tempfile::tempdir().unwrap();
+    let log = logs.path().join("server.log");
+    let _server = HttpServer::start_logging_to(
+        "full",
+        "127.0.0.1",
+        &[
+            ("OBSIDIAN_DENY_PATHS", "Private/"),
+            ("OBSIDIAN_SEMANTIC_MODE", "daemon"),
+            ("OBSIDIAN_LOG_LEVEL", "info"),
+            ("NO_COLOR", "1"),
+        ],
+        |_| {},
+        Some(&log),
+    )
+    .await;
+
+    let log = std::fs::read_to_string(&log).unwrap();
+    assert!(log.contains("semantic daemon disabled"), "{log}");
+    assert!(log.contains("semantic_mode=\"local\""), "{log}");
+    assert!(log.contains("daemon_ready=false"), "{log}");
 }
