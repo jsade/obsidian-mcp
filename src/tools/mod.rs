@@ -81,7 +81,12 @@ pub struct SemanticRuntime {
     pub vault_ensured: Arc<AtomicBool>,
 }
 
+/// `tracing` target of the write log: one event per mutating tool call.
+pub const WRITE_LOG_TARGET: &str = "obsidian_mcp::write_log";
+
 pub struct ObsidianMcp {
+    /// Who the write log names: the bearer token's name over HTTP.
+    client: Arc<str>,
     vault: Vault,
     hybrid_alpha: f32,
     semantic_runtime: SemanticRuntime,
@@ -107,11 +112,43 @@ impl ObsidianMcp {
             }
         }
         Self {
+            client: Arc::from("stdio"),
             tool_router,
             vault,
             hybrid_alpha,
             semantic_runtime,
         }
+    }
+
+    /// Name the client this server instance acts for in the write log.
+    pub fn with_client_name(mut self, client: Arc<str>) -> Self {
+        self.client = client;
+        self
+    }
+
+    /// Record one mutating tool call in the write log, refused and failed
+    /// calls included, and hand the result back.
+    fn log_write<T>(
+        &self,
+        tool: &'static str,
+        path: &str,
+        to: Option<&str>,
+        result: Result<T, ErrorData>,
+    ) -> Result<T, ErrorData> {
+        // A path is client input: keep one call from filling the log.
+        let clip = |text: &str| -> String { text.chars().take(512).collect() };
+        let (path, to) = (clip(path), to.map(clip));
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        tracing::info!(
+            target: WRITE_LOG_TARGET,
+            client = %self.client,
+            tool,
+            path,
+            to,
+            outcome,
+            "write"
+        );
+        result
     }
 
     // ── Navigation ──────────────────────────────────────────────────
@@ -171,7 +208,9 @@ impl ObsidianMcp {
         &self,
         Parameters(params): Parameters<notes::NoteCreateParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        output::message(notes::note_create(&self.vault, params).await?)
+        let path = params.path.clone();
+        let result = notes::note_create(&self.vault, params).await;
+        output::message(self.log_write("note_create", &path, None, result)?)
     }
 
     #[tool(
@@ -184,7 +223,9 @@ impl ObsidianMcp {
         &self,
         Parameters(params): Parameters<notes::NoteWriteParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        output::message(notes::note_write(&self.vault, params).await?)
+        let path = params.path.clone();
+        let result = notes::note_write(&self.vault, params).await;
+        output::message(self.log_write("note_write", &path, None, result)?)
     }
 
     #[tool(
@@ -199,7 +240,9 @@ impl ObsidianMcp {
         &self,
         Parameters(params): Parameters<notes::NoteInsertParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        output::message(notes::note_insert(&self.vault, params).await?)
+        let path = params.path.clone();
+        let result = notes::note_insert(&self.vault, params).await;
+        output::message(self.log_write("note_insert", &path, None, result)?)
     }
 
     #[tool(
@@ -212,7 +255,9 @@ impl ObsidianMcp {
         &self,
         Parameters(params): Parameters<notes::NotePatchParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        output::message(notes::note_patch(&self.vault, params).await?)
+        let path = params.path.clone();
+        let result = notes::note_patch(&self.vault, params).await;
+        output::message(self.log_write("note_patch", &path, None, result)?)
     }
 
     #[tool(
@@ -225,7 +270,9 @@ impl ObsidianMcp {
         &self,
         Parameters(params): Parameters<notes::NoteDeleteParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        output::message(notes::note_delete(&self.vault, params).await?)
+        let path = params.path.clone();
+        let result = notes::note_delete(&self.vault, params).await;
+        output::message(self.log_write("note_delete", &path, None, result)?)
     }
 
     #[tool(
@@ -238,7 +285,9 @@ impl ObsidianMcp {
         &self,
         Parameters(params): Parameters<notes::NoteMoveParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        output::message(notes::note_move(&self.vault, params).await?)
+        let (from, to) = (params.from.clone(), params.to.clone());
+        let result = notes::note_move(&self.vault, params).await;
+        output::message(self.log_write("note_move", &from, Some(&to), result)?)
     }
 
     // ── Search ──────────────────────────────────────────────────────
@@ -326,7 +375,12 @@ impl ObsidianMcp {
         &self,
         Parameters(params): Parameters<metadata::FrontmatterParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        metadata::frontmatter(&self.vault, params).await
+        if params.action.eq_ignore_ascii_case("get") {
+            return metadata::frontmatter(&self.vault, params).await;
+        }
+        let path = params.path.clone();
+        let result = metadata::frontmatter(&self.vault, params).await;
+        self.log_write("frontmatter", &path, None, result)
     }
 
     // ── Graph / Links ───────────────────────────────────────────────
@@ -359,7 +413,19 @@ impl ObsidianMcp {
         &self,
         Parameters(params): Parameters<periodic::PeriodicParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        periodic::periodic(&self.vault, params).await
+        if !params.action.eq_ignore_ascii_case("create") {
+            return periodic::periodic(&self.vault, params).await;
+        }
+        let result = periodic::periodic(&self.vault, params).await;
+        // The note's path is computed from the vault's settings; a failed call has none.
+        let path = result
+            .as_ref()
+            .ok()
+            .and_then(|created| created.structured_content.as_ref())
+            .and_then(|content| content["path"].as_str())
+            .unwrap_or("(periodic note)")
+            .to_owned();
+        self.log_write("periodic", &path, None, result)
     }
 
     // ── Utility ─────────────────────────────────────────────────────

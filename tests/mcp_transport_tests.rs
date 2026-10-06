@@ -795,6 +795,294 @@ async fn an_invalid_scope_pattern_stops_the_server() {
 }
 
 #[tokio::test]
+async fn http_serves_the_configured_public_hosts_and_refuses_others() {
+    let server = HttpServer::start_custom(
+        "full",
+        "127.0.0.1",
+        &[
+            (
+                "OBSIDIAN_HTTP_ALLOWED_HOSTS",
+                "vault.example.com, pinned.example.com:8443",
+            ),
+            ("OBSIDIAN_HTTP_AUTH_TOKEN", "host-test-token"),
+        ],
+        |_| {},
+    )
+    .await;
+    for (host, expected) in [
+        ("vault.example.com", StatusCode::OK),
+        ("vault.example.com:1234", StatusCode::OK),
+        ("VAULT.example.com", StatusCode::OK),
+        ("pinned.example.com:8443", StatusCode::OK),
+        ("pinned.example.com:9", StatusCode::FORBIDDEN),
+        ("pinned.example.com", StatusCode::FORBIDDEN),
+        ("evil.vault.example.com", StatusCode::FORBIDDEN),
+        ("untrusted.example", StatusCode::FORBIDDEN),
+    ] {
+        let response = server
+            .request("server/discover", json!({}), MODERN)
+            .header("Host", host)
+            .header("Authorization", "Bearer host-test-token")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{host}");
+    }
+    server.stop().await;
+}
+
+fn token_line(name: &str, token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("{name}:{digest}\n")
+}
+
+#[tokio::test]
+async fn a_named_token_is_revoked_while_the_others_keep_working() {
+    let config = tempfile::tempdir().unwrap();
+    let tokens = config.path().join("tokens");
+    std::fs::write(
+        &tokens,
+        token_line("laptop", "laptop-token") + &token_line("phone", "phone-token"),
+    )
+    .unwrap();
+    let server = HttpServer::start_custom(
+        "full",
+        "127.0.0.1",
+        &[
+            ("OBSIDIAN_HTTP_AUTH_TOKENS_FILE", tokens.to_str().unwrap()),
+            ("OBSIDIAN_HTTP_AUTH_TOKEN", "legacy-token"),
+        ],
+        |_| {},
+    )
+    .await;
+    let status = async |token: &str| {
+        server
+            .request("server/discover", json!({}), MODERN)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    for token in ["laptop-token", "phone-token", "legacy-token"] {
+        assert_eq!(status(token).await, StatusCode::OK, "{token}");
+    }
+    assert_eq!(status("unknown-token").await, StatusCode::UNAUTHORIZED);
+    // A session the laptop opened before it was revoked.
+    let opened = server
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": LEGACY,
+                "capabilities": {},
+                "clientInfo": {"name": "legacy-client", "version": "1"}
+            }),
+            LEGACY,
+        )
+        .header("Authorization", "Bearer laptop-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), StatusCode::OK);
+    let session = opened.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+
+    // A session answers only to the token that opened it, so one client
+    // cannot write under another's name.
+    let session_status = async |token: &str| {
+        server
+            .request("tools/list", json!({}), LEGACY)
+            .header("Mcp-Session-Id", &session)
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    assert_eq!(session_status("phone-token").await, StatusCode::FORBIDDEN);
+    assert_eq!(session_status("legacy-token").await, StatusCode::FORBIDDEN);
+    assert_ne!(session_status("laptop-token").await, StatusCode::FORBIDDEN);
+    let unknown = server
+        .request("tools/list", json!({}), LEGACY)
+        .header("Mcp-Session-Id", "no-such-session")
+        .header("Authorization", "Bearer phone-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    // Revoke the laptop: no restart, the same server process.
+    std::fs::write(&tokens, token_line("phone", "phone-token")).unwrap();
+    assert_eq!(status("laptop-token").await, StatusCode::UNAUTHORIZED);
+    assert_eq!(status("phone-token").await, StatusCode::OK);
+    assert_eq!(status("legacy-token").await, StatusCode::OK);
+    let reused = server
+        .request("tools/list", json!({}), LEGACY)
+        .header("Mcp-Session-Id", &session)
+        .header("Authorization", "Bearer laptop-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reused.status(), StatusCode::UNAUTHORIZED);
+    // Nobody else inherits the revoked client's session.
+    assert_eq!(session_status("phone-token").await, StatusCode::FORBIDDEN);
+
+    // A broken file refuses its tokens until it is repaired.
+    std::fs::write(&tokens, "phone:not-a-digest\n").unwrap();
+    assert_eq!(status("phone-token").await, StatusCode::UNAUTHORIZED);
+    assert_eq!(status("legacy-token").await, StatusCode::OK);
+    std::fs::write(&tokens, token_line("phone", "phone-token")).unwrap();
+    assert_eq!(status("phone-token").await, StatusCode::OK);
+    assert!(server.child.id().is_some(), "server restarted or exited");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn public_hosts_without_a_token_stop_the_server() {
+    let vault = temporary_vault();
+    let status = server_command(&vault)
+        .args(["--http", "--port", &free_port("127.0.0.1").to_string()])
+        .env("OBSIDIAN_HTTP_ALLOWED_HOSTS", "vault.example.com")
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .unwrap();
+    assert!(!status.success());
+}
+
+#[tokio::test]
+async fn a_missing_token_file_stops_the_server() {
+    let vault = temporary_vault();
+    let status = server_command(&vault)
+        .args(["--http", "--port", &free_port("127.0.0.1").to_string()])
+        .env(
+            "OBSIDIAN_HTTP_AUTH_TOKENS_FILE",
+            vault.path().join("absent"),
+        )
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .unwrap();
+    assert!(!status.success());
+}
+
+#[tokio::test]
+async fn every_write_is_logged_with_the_token_name_tool_and_path() {
+    let config = tempfile::tempdir().unwrap();
+    let tokens = config.path().join("tokens");
+    std::fs::write(&tokens, token_line("laptop", "laptop-token")).unwrap();
+    let log_path = config.path().join("server.log");
+    // `server_command` sets the log level to `error`: the write log must
+    // not depend on it.
+    let server = HttpServer::start_logging_to(
+        "full",
+        "127.0.0.1",
+        &[("OBSIDIAN_HTTP_AUTH_TOKENS_FILE", tokens.to_str().unwrap())],
+        |_| {},
+        Some(&log_path),
+    )
+    .await;
+    let call = async |name: &str, arguments: Value| {
+        let response = server
+            .request(
+                "tools/call",
+                json!({"name": name, "arguments": arguments}),
+                MODERN,
+            )
+            .header("Authorization", "Bearer laptop-token")
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    };
+    call(
+        "note_create",
+        json!({"path": "log/a.md", "content": "# A\n"}),
+    )
+    .await;
+    call(
+        "note_write",
+        json!({"path": "log/a.md", "content": "# A\nbody\n"}),
+    )
+    .await;
+    call(
+        "note_insert",
+        json!({"path": "log/a.md", "content": "more\n"}),
+    )
+    .await;
+    call(
+        "note_patch",
+        json!({
+            "path": "log/a.md", "operation": "append", "target_type": "heading",
+            "target": "A", "content": "patched\n"
+        }),
+    )
+    .await;
+    call(
+        "frontmatter",
+        json!({"action": "set", "path": "log/a.md", "key": "status", "value": "open"}),
+    )
+    .await;
+    call(
+        "frontmatter",
+        json!({"action": "remove", "path": "log/a.md", "key": "status"}),
+    )
+    .await;
+    call("note_move", json!({"from": "log/a.md", "to": "log/b.md"})).await;
+    call("note_delete", json!({"path": "log/b.md", "confirm": true})).await;
+    call(
+        "periodic",
+        json!({"action": "create", "period": "daily", "date": "2026-01-02"}),
+    )
+    .await;
+    call("note_create", json!({"path": "note.md", "content": "x"})).await;
+    // Reads leave no entry.
+    call("note_read", json!({"path": "note.md"})).await;
+    call("frontmatter", json!({"action": "get", "path": "note.md"})).await;
+    call("periodic", json!({"action": "list", "period": "daily"})).await;
+    server.stop().await;
+
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let entries: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("obsidian_mcp::write_log"))
+        .collect();
+    let expected = [
+        ("note_create", "log/a.md", "ok"),
+        ("note_write", "log/a.md", "ok"),
+        ("note_insert", "log/a.md", "ok"),
+        ("note_patch", "log/a.md", "ok"),
+        ("frontmatter", "log/a.md", "ok"),
+        ("frontmatter", "log/a.md", "ok"),
+        ("note_move", "log/a.md", "ok"),
+        ("note_delete", "log/b.md", "ok"),
+        ("periodic", "2026-01-02.md", "ok"),
+        ("note_create", "note.md", "error"),
+    ];
+    assert_eq!(entries.len(), expected.len(), "{log}");
+    for (entry, (tool, path, outcome)) in entries.iter().zip(expected) {
+        for part in [
+            "client=laptop".to_string(),
+            format!("tool=\"{tool}\""),
+            path.to_string(),
+            format!("outcome=\"{outcome}\""),
+        ] {
+            assert!(entry.contains(&part), "missing {part} in: {entry}");
+        }
+        // Each entry carries its own timestamp.
+        assert!(entry.starts_with("20"), "{entry}");
+    }
+    assert!(entries[6].contains("to=\"log/b.md\""), "{}", entries[6]);
+    assert!(!log.contains("laptop-token"), "token value in the log");
+}
+
+#[tokio::test]
 async fn stdio_keeps_the_legacy_initialize_and_tool_call_flow() {
     let vault = temporary_vault();
     let mut child = server_command(&vault)

@@ -20,6 +20,8 @@ use obsidian_mcp::vault::Vault;
 
 tokio::task_local! {
     static REQUEST_DISABLED_TOOLS: HashSet<String>;
+    /// Name of the bearer token that authenticated the current HTTP request.
+    static REQUEST_CLIENT: Arc<str>;
 }
 
 const DAEMON_DISABLED_BY_WATCH_REASON: &str =
@@ -36,8 +38,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut semantic_runtime_config = SemanticRuntimeConfig::load_from_env();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(&config.log_level))
+        // The write log stays on whatever the general log level is.
+        .with_env_filter(EnvFilter::new(format!(
+            "{},{}=info",
+            config.log_level,
+            obsidian_mcp::tools::WRITE_LOG_TARGET
+        )))
         .with_writer(std::io::stderr)
+        // No colour codes in a log file.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .init();
 
     tracing::info!(
@@ -108,6 +117,21 @@ async fn serve_http(
     mcp_config.legacy_session_mode = true;
     mcp_config.json_response = true;
     allow_bind_host(&mut mcp_config, config.http_host);
+    let extra_hosts = obsidian_mcp::config::allowed_hosts_from_env();
+    // Read here rather than into `Config`, which derives `Debug`.
+    let tokens = obsidian_mcp::http_auth::TokenSet::from_env()?;
+    if !extra_hosts.is_empty() && tokens.is_none() {
+        return Err(
+            "OBSIDIAN_HTTP_ALLOWED_HOSTS opens the endpoint to other hosts, which needs \
+                    OBSIDIAN_HTTP_AUTH_TOKENS_FILE or OBSIDIAN_HTTP_AUTH_TOKEN"
+                .into(),
+        );
+    }
+    let auth_required = tokens.is_some();
+    if !extra_hosts.is_empty() {
+        tracing::info!(hosts = ?extra_hosts, "additional Host names accepted");
+        mcp_config.allowed_hosts.extend(extra_hosts);
+    }
 
     let health_vault = vault.clone();
     let mcp_service: StreamableHttpService<ObsidianMcp, LocalSessionManager> =
@@ -123,12 +147,22 @@ async fn serve_http(
                             "HTTP tool filter context unavailable: {error}"
                         ))
                     })?;
+                let client = match REQUEST_CLIENT.try_with(Arc::clone) {
+                    Ok(client) => client,
+                    Err(_) if !auth_required => Arc::from("anonymous"),
+                    Err(error) => {
+                        return Err(std::io::Error::other(format!(
+                            "HTTP client identity unavailable: {error}"
+                        )));
+                    }
+                };
                 Ok(ObsidianMcp::new(
                     vault.clone(),
                     hybrid_alpha,
                     semantic_runtime.clone(),
                     disabled,
-                ))
+                )
+                .with_client_name(client))
             },
             Arc::new(LocalSessionManager::default()),
             mcp_config,
@@ -137,13 +171,12 @@ async fn serve_http(
     let mut mcp_router = Router::new()
         .nest_service("/mcp", mcp_service)
         .layer(middleware::from_fn(tool_filter_middleware));
-    // Read here rather than into `Config`, which derives `Debug`.
-    if let Some(token) = std::env::var("OBSIDIAN_HTTP_AUTH_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty())
-    {
+    if let Some(tokens) = tokens {
         mcp_router = mcp_router.layer(middleware::from_fn_with_state(
-            Arc::<str>::from(token),
+            Arc::new(HttpAuth {
+                tokens,
+                sessions: Default::default(),
+            }),
             bearer_auth_middleware,
         ));
         tracing::info!("HTTP MCP endpoint requires a bearer token");
@@ -176,38 +209,80 @@ fn allow_bind_host(
     }
 }
 
-/// Refuse an MCP request unless it carries `Authorization: Bearer <token>`.
+struct HttpAuth {
+    tokens: obsidian_mcp::http_auth::TokenSet,
+    sessions: obsidian_mcp::http_auth::SessionOwners,
+}
+
+/// Refuse an MCP request unless it carries `Authorization: Bearer <token>`
+/// with a known token, and record that token's name for the write log. A
+/// session answers only to the token that opened it.
 /// `/health` sits outside this layer so `serve` and `restart` can probe it.
 async fn bearer_auth_middleware(
-    axum::extract::State(token): axum::extract::State<Arc<str>>,
+    axum::extract::State(auth): axum::extract::State<Arc<HttpAuth>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    use axum::http::StatusCode;
     use axum::response::IntoResponse;
+    use obsidian_mcp::http_auth::SessionAccess;
 
-    let authorized = request
+    const SESSION_HEADER: &str = "mcp-session-id";
+
+    let client = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split_once(' '))
-        .is_some_and(|(scheme, presented)| {
-            scheme.eq_ignore_ascii_case("Bearer")
-                && constant_time_eq(presented.trim().as_bytes(), token.as_bytes())
-        });
-    if !authorized {
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .and_then(|(_, presented)| auth.tokens.authenticate(presented.trim()));
+    let Some(client) = client else {
         tracing::warn!("rejected HTTP MCP request without a valid bearer token");
         return (
-            axum::http::StatusCode::UNAUTHORIZED,
+            StatusCode::UNAUTHORIZED,
             [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
             "Unauthorized",
         )
             .into_response();
-    }
-    next.run(request).await
-}
+    };
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    let session = match request.headers().get(SESSION_HEADER).map(|id| id.to_str()) {
+        Some(Ok(id)) => Some(id.to_owned()),
+        Some(Err(_)) => return (StatusCode::BAD_REQUEST, "Invalid session id").into_response(),
+        None => None,
+    };
+    if let Some(session) = &session {
+        match auth.sessions.access(session, &client) {
+            SessionAccess::Owner => {}
+            SessionAccess::Foreign => {
+                tracing::warn!(%client, "rejected a request for another client's session");
+                return (StatusCode::FORBIDDEN, "Forbidden").into_response();
+            }
+            // The client opens a new session, as for any expired one.
+            SessionAccess::Unknown => {
+                return (StatusCode::NOT_FOUND, "Session not found").into_response();
+            }
+        }
+    }
+    let closing = request.method() == axum::http::Method::DELETE;
+
+    let response = REQUEST_CLIENT
+        .scope(Arc::clone(&client), next.run(request))
+        .await;
+    match &session {
+        Some(session) if closing => auth.sessions.forget(session),
+        Some(_) => {}
+        None => {
+            if let Some(opened) = response
+                .headers()
+                .get(SESSION_HEADER)
+                .and_then(|id| id.to_str().ok())
+            {
+                auth.sessions.bind(opened, client);
+            }
+        }
+    }
+    response
 }
 
 async fn tool_filter_middleware(
@@ -465,6 +540,8 @@ fn print_help() {
              OBSIDIAN_HTTP_PORT      HTTP listen port               [default: 37842]\n    \
              OBSIDIAN_HTTP_HOST      HTTP bind address              [default: 127.0.0.1]\n    \
              OBSIDIAN_HTTP_AUTH_TOKEN  Require this bearer token on /mcp  [default: none]\n    \
+             OBSIDIAN_HTTP_AUTH_TOKENS_FILE  Named tokens, name:sha256 per line  [default: none]\n    \
+             OBSIDIAN_HTTP_ALLOWED_HOSTS  Extra Host names to accept  [default: none]\n    \
              OBSIDIAN_WATCH          Enable filesystem watcher      [default: true]\n    \
              OBSIDIAN_LOG_LEVEL      Tracing log level              [default: info]\n    \
              OBSIDIAN_TANTIVY        Enable BM25 full-text index    [default: true]\n    \
