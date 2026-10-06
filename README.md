@@ -573,6 +573,8 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `OBSIDIAN_TOOLS` | No | `full` | Tool filtering: profile name, comma-separated allow-list, or `!`-prefixed deny-list |
 | `OBSIDIAN_MCP_DATA` | No | `{vault}/.obsidian-mcp` | External obsidian-mcp data directory. When set, cache/config data is stored under `{value}/vaults/{vault_slug}/` and merged with vault-local config |
 | `OBSIDIAN_EXCLUDE_PATHS` | No | *(empty)* | Comma-separated glob patterns excluded from indexing, search, graph, and stats. Merged with `.obsidian-mcp/ignore`; restart after changing ignore files |
+| `OBSIDIAN_DENY_PATHS` | No | *(empty)* | Comma-separated folder globs that no tool may read, write, move, delete, list or find. See [Folder scope](#folder-scope) |
+| `OBSIDIAN_ALLOW_PATHS` | No | *(empty)* | When set, only paths matching these globs are reachable. See [Folder scope](#folder-scope) |
 | `OBSIDIAN_EMBEDDINGS` | No | `false` | Semantic embedding search (requires `embeddings` or `embeddings-api` feature) |
 | `OBSIDIAN_EMBEDDINGS_MODEL` | No | `BAAI/bge-small-en-v1.5` | HuggingFace model for embeddings |
 | `OBSIDIAN_EMBEDDING_PROVIDER` | No | *(infer)* | Embedding backend: `local` (fastembed) or `api` (OpenAI-compatible) |
@@ -597,6 +599,27 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `FASTEMBED_CACHE_DIR` | No | `<semantic-home>/model/fastembed-cache` | Daemon-internal shared fastembed cache root |
 
 \* Also accepted as the first CLI argument: `obsidian-mcp /path/to/vault`
+
+### Folder scope
+
+`OBSIDIAN_EXCLUDE_PATHS` only hides notes from indexing and search: a client that knows a path can still read or overwrite the note. To keep a folder out of reach entirely, use the folder scope:
+
+```sh
+OBSIDIAN_DENY_PATHS="Private/,Clients/Contracts/" obsidian-mcp --http
+```
+
+- `OBSIDIAN_DENY_PATHS` lists folders no tool may touch. `OBSIDIAN_ALLOW_PATHS`, when set, limits the server to the listed folders. Deny wins over allow.
+- The patterns are globs relative to the vault root. A pattern covers the entry it names and everything under it, so `Private`, `Private/` and `Private/**` mean the same. A leading `/` or `./` is dropped. `*`, `?`, `[`, `]`, `{` and `}` are glob characters: write `\\[` to mean a literal bracket in a folder name. `*` also matches `/`, so `*.key` covers that file type in every folder.
+- Every tool obeys the scope. A path outside it is refused with `Access denied`, whether or not the note exists. Scoped-out notes are not indexed, so search, tags, links, orphans, listings and the file counts in `vault_info` do not include them.
+- Matching ignores case and Unicode normalization form, and follows symlinks, so `private/x.md` and a symlink into `Private/` are refused too.
+- While a scope is set, hidden folders such as `.obsidian` and `.trash` are out of reach as well. They hold deleted notes and the names of recently opened notes from every folder.
+- While a scope is set, `note_move` moves notes only, not folders. A move is refused when either end is outside the scope.
+- With an allow list, only the vault root and the allowed folders can be listed. A listing of the root shows only what is allowed.
+- While a scope is set, semantic search runs in `OBSIDIAN_SEMANTIC_MODE=local`, whatever that setting says. The shared semantic daemon reads and embeds every note in a vault, so the server does not attach the vault to it. A build without the `embeddings` feature has no semantic search while a scope is set. If the daemon indexed this vault before the scope was set, its cache still holds the old embeddings: delete that cache.
+- An invalid pattern, or one that would cover the whole vault (`*`, `**`, `*.md`), stops the server at startup. A misspelt variable name such as `OBSIDIAN_DENY_PATH` is reported in the log, because it would otherwise leave the vault open.
+- `vault_info` does not show the scope patterns. Its `excluded_notes` count includes scoped-out notes.
+- The scope applies to the whole server. Restart after changing it.
+- The scope covers what the server does. A symlink or hard link that another program creates inside an allowed folder is outside its control: a symlink is checked by where it points, a hard link cannot be told apart from an ordinary file.
 
 ## Architecture
 

@@ -34,7 +34,7 @@ use crate::models::{
     SearchResult, VaultStats, WikiLink,
 };
 
-use self::exclude::ExcludeSet;
+use self::exclude::{ExcludeSet, PathScope};
 use self::index::VaultIndex;
 use self::tantivy_index::TantivyIndex;
 use self::watcher::ChangeWatcher;
@@ -56,6 +56,7 @@ struct VaultInner {
     mcp_home: PathBuf,
     mcp_data: PathBuf,
     exclude: Arc<ExcludeSet>,
+    scope: Arc<PathScope>,
     index: Arc<RwLock<VaultIndex>>,
     mutations: Mutex<()>,
     tantivy: Option<Arc<TantivyIndex>>,
@@ -90,9 +91,24 @@ impl Vault {
         Self::open_with_embedding_loader(config, None).await
     }
 
+    /// Open a vault that exposes only the paths inside `scope`. Every operation
+    /// refuses a path outside it with [`VaultError::AccessDenied`], and scoped-out
+    /// notes are never indexed, so search, graph and stats cannot find them.
+    pub async fn open_scoped(config: &Config, scope: PathScope) -> VaultResult<Self> {
+        Self::open_inner(config, None, scope).await
+    }
+
     async fn open_with_embedding_loader(
         config: &Config,
+        embedding_loader: Option<EmbeddingLoaderFuture>,
+    ) -> VaultResult<Self> {
+        Self::open_inner(config, embedding_loader, PathScope::unrestricted()).await
+    }
+
+    async fn open_inner(
+        config: &Config,
         _embedding_loader: Option<EmbeddingLoaderFuture>,
+        scope: PathScope,
     ) -> VaultResult<Self> {
         let root = config.vault_path.canonicalize().map_err(|_| {
             VaultError::InvalidPath(format!(
@@ -163,7 +179,12 @@ impl Vault {
         patterns.sort();
         patterns.dedup();
 
-        let exclude = Arc::new(exclude::ExcludeSet::build(patterns)?);
+        let scope = Arc::new(scope);
+        if !scope.is_unrestricted() {
+            tracing::info!("folder scope active: paths outside it are refused");
+        }
+        let exclude =
+            Arc::new(exclude::ExcludeSet::build(patterns)?.with_scope(Arc::clone(&scope), &root));
 
         if !exclude.is_empty() {
             tracing::info!(
@@ -240,6 +261,7 @@ impl Vault {
                 mcp_home,
                 mcp_data,
                 exclude,
+                scope,
                 index,
                 mutations: Mutex::new(()),
                 tantivy,
@@ -283,18 +305,32 @@ impl Vault {
         recursive: bool,
         glob: Option<&str>,
     ) -> VaultResult<Vec<PathBuf>> {
-        fs::list_files(&self.inner.root, dir, recursive, glob)
+        let scope = &self.inner.scope;
+        if scope.is_unrestricted() {
+            return fs::list_files(&self.inner.root, dir, recursive, glob);
+        }
+        // The vault root is always listable; what it shows is filtered below.
+        if !path::normalize_relative(dir)?.as_os_str().is_empty() {
+            self.guard(dir)?;
+        }
+        let mut files = fs::list_files(&self.inner.root, dir, recursive, glob)?;
+        // A symlink entry is judged by where it points.
+        files.retain(|path| !self.inner.exclude.is_out_of_scope(path));
+        Ok(files)
     }
 
     pub fn read_note(&self, path: &Path) -> VaultResult<String> {
+        self.guard(path)?;
         fs::read_file(&self.inner.root, path)
     }
 
     pub fn file_stat(&self, path: &Path) -> VaultResult<FileStat> {
+        self.guard(path)?;
         fs::file_stat(&self.inner.root, path)
     }
 
     pub fn write_note(&self, path: &Path, content: &str) -> VaultResult<()> {
+        self.guard(path)?;
         let _mutation = self.lock_mutations()?;
         frontmatter::parse_frontmatter(content)?;
         let actual_path = fs::write_file(&self.inner.root, path, content)?;
@@ -303,6 +339,7 @@ impl Vault {
     }
 
     pub fn append_note(&self, path: &Path, content: &str) -> VaultResult<()> {
+        self.guard(path)?;
         let _mutation = self.lock_mutations()?;
         let combined = match fs::read_file(&self.inner.root, path) {
             Ok(existing) => existing + content,
@@ -323,6 +360,7 @@ impl Vault {
         content: &str,
         frontmatter: Option<&serde_json::Value>,
     ) -> VaultResult<()> {
+        self.guard(path)?;
         let _mutation = self.lock_mutations()?;
         if let Some(value) = frontmatter
             && !value.is_object()
@@ -341,6 +379,7 @@ impl Vault {
 
     /// Prepend content after frontmatter (or at the start if none exists).
     pub fn prepend_note(&self, path: &Path, content: &str) -> VaultResult<()> {
+        self.guard(path)?;
         let _mutation = self.lock_mutations()?;
         let existing = fs::read_file(&self.inner.root, path)?;
         let new_content = match frontmatter::extract_raw_frontmatter(&existing) {
@@ -360,6 +399,7 @@ impl Vault {
     }
 
     pub fn delete_note(&self, path: &Path) -> VaultResult<()> {
+        self.guard(path)?;
         let _mutation = self.lock_mutations()?;
         let actual_path = fs::delete_file(&self.inner.root, path)?;
         self.write_index().remove_file(&actual_path);
@@ -374,6 +414,14 @@ impl Vault {
     }
 
     pub fn move_note(&self, from: &Path, to: &Path) -> VaultResult<PathBuf> {
+        self.guard(from)?;
+        self.guard(to)?;
+        // Renaming a folder would carry a scoped-out subfolder along with it.
+        if !self.inner.scope.is_unrestricted()
+            && path::resolve_existing(&self.inner.root, from).is_ok_and(|r| r.absolute.is_dir())
+        {
+            return Err(VaultError::AccessDenied(from.to_path_buf()));
+        }
         let _mutation = self.lock_mutations()?;
         let move_result = fs::move_file(&self.inner.root, from, to)?;
         let old_path = move_result.from;
@@ -395,6 +443,7 @@ impl Vault {
     // ── patch delegation ───────────────────────────────────────────────
 
     pub fn patch_note(&self, path: &Path, request: &PatchRequest) -> VaultResult<()> {
+        self.guard(path)?;
         let _mutation = self.lock_mutations()?;
         let content = fs::read_file(&self.inner.root, path)?;
         let patched = patch::apply_patch(&content, request, path)?;
@@ -407,6 +456,7 @@ impl Vault {
     // ── frontmatter delegation ─────────────────────────────────────────
 
     pub fn get_frontmatter(&self, path: &Path) -> VaultResult<Option<serde_json::Value>> {
+        self.guard(path)?;
         let content = fs::read_file(&self.inner.root, path)?;
         frontmatter::parse_frontmatter(&content)
     }
@@ -417,6 +467,7 @@ impl Vault {
         key: &str,
         value: serde_json::Value,
     ) -> VaultResult<()> {
+        self.guard(path)?;
         let _mutation = self.lock_mutations()?;
         let content = fs::read_file(&self.inner.root, path)?;
         let updated = frontmatter::set_frontmatter_field(&content, key, value)?;
@@ -427,6 +478,7 @@ impl Vault {
     }
 
     pub fn remove_frontmatter_field(&self, path: &Path, key: &str) -> VaultResult<()> {
+        self.guard(path)?;
         let _mutation = self.lock_mutations()?;
         let content = fs::read_file(&self.inner.root, path)?;
         let updated = frontmatter::remove_frontmatter_field(&content, key)?;
@@ -447,6 +499,7 @@ impl Vault {
     }
 
     pub fn get_note_metadata(&self, path: &Path) -> VaultResult<NoteMetadata> {
+        self.guard(path)?;
         let actual_path = self.canonical_existing_relative_path(path)?;
         self.read_index()
             .get_note(&actual_path)
@@ -477,6 +530,7 @@ impl Vault {
     }
 
     pub fn get_document_map(&self, path: &Path) -> VaultResult<DocumentMap> {
+        self.guard(path)?;
         let content = fs::read_file(&self.inner.root, path)?;
         Ok(parser::build_document_map(&content))
     }
@@ -691,6 +745,7 @@ impl Vault {
     }
 
     pub fn backlinks(&self, path: &Path) -> VaultResult<Vec<NoteMetadata>> {
+        self.guard(path)?;
         let actual_path = self.canonical_existing_relative_path(path)?;
         Ok(self
             .read_index()
@@ -701,6 +756,7 @@ impl Vault {
     }
 
     pub fn outgoing_links(&self, path: &Path) -> VaultResult<Vec<WikiLink>> {
+        self.guard(path)?;
         let actual_path = self.canonical_existing_relative_path(path)?;
         Ok(self
             .read_index()
@@ -732,11 +788,13 @@ impl Vault {
     }
 
     pub(crate) fn canonical_existing_relative_path(&self, path: &Path) -> VaultResult<PathBuf> {
+        self.guard(path)?;
         Ok(path::resolve_existing(&self.inner.root, path)?.relative)
     }
 
     /// Validate that a relative path doesn't escape the vault root.
     pub fn validate_path(&self, path: &Path) -> VaultResult<()> {
+        self.guard(path)?;
         fs::resolve_path(&self.inner.root, path)?;
         Ok(())
     }
@@ -751,6 +809,7 @@ impl Vault {
         let config = periodic::read_periodic_config(&self.inner.root, period)?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
         let path = periodic::periodic_note_path(&config, &date)?;
+        self.guard(&path)?;
         fs::read_file(&self.inner.root, &path)
     }
 
@@ -764,12 +823,18 @@ impl Vault {
         let config = periodic::read_periodic_config(&self.inner.root, period)?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
         let path = periodic::periodic_note_path(&config, &date)?;
+        self.guard(&path)?;
 
         let content = if let Some(custom) = content_override {
             custom.to_owned()
         } else {
             match &config.template {
                 Some(tmpl) if !tmpl.is_empty() => {
+                    // `expand_template` reads `<template>.md` when no extension is given.
+                    self.guard(Path::new(tmpl))?;
+                    if Path::new(tmpl).extension().is_none() {
+                        self.guard(&Path::new(tmpl).with_extension("md"))?;
+                    }
                     let title = path
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -797,7 +862,10 @@ impl Vault {
         limit: usize,
     ) -> VaultResult<Vec<PathBuf>> {
         let config = periodic::read_periodic_config(&self.inner.root, period)?;
-        periodic::list_recent_periodic_notes(&self.inner.root, &config, limit)
+        let mut notes = periodic::list_recent_periodic_notes(&self.inner.root, &config, limit)?;
+        // The folder comes from the vault's own settings and is not normalized.
+        notes.retain(|path| self.guard(path).is_ok());
+        Ok(notes)
     }
 
     // ── private helpers ────────────────────────────────────────────────
@@ -856,6 +924,60 @@ impl Vault {
         Ok(results)
     }
 
+    /// Refuse a caller-supplied path outside the folder scope.
+    ///
+    /// The check covers every spelling of the path: the caller's, the entry on
+    /// disk (which a case-insensitive filesystem may spell differently) and the
+    /// symlink-resolved location. The answer does not depend on whether the
+    /// path exists, so a refusal reveals nothing.
+    ///
+    /// Hidden entries (`.obsidian`, `.trash`) are refused as well: they hold
+    /// copies and names of notes from every folder, scoped out or not.
+    fn guard(&self, path: &Path) -> VaultResult<()> {
+        let scope = &self.inner.scope;
+        if scope.is_unrestricted() {
+            return Ok(());
+        }
+        let denied = || VaultError::AccessDenied(path.to_path_buf());
+        let refused =
+            |candidate: &Path| !exclude::is_visible_path(candidate) || !scope.permits(candidate);
+        if refused(&path::normalize_relative(path)?) {
+            return Err(denied());
+        }
+        let Ok(resolved) = path::resolve_for_write(&self.inner.root, path) else {
+            // The operation itself reports a path that cannot be resolved.
+            return Ok(());
+        };
+        if refused(&resolved.relative) {
+            return Err(denied());
+        }
+        // Follow symlinks through the deepest ancestor that exists.
+        let mut existing = resolved.absolute.as_path();
+        let real = loop {
+            if let Ok(real) = existing.canonicalize() {
+                break real;
+            }
+            // A dangling symlink: a write would land wherever it points.
+            if existing.is_symlink() {
+                return Err(denied());
+            }
+            match existing.parent() {
+                Some(parent) => existing = parent,
+                None => return Ok(()),
+            }
+        };
+        let tail = resolved
+            .absolute
+            .strip_prefix(existing)
+            .unwrap_or(Path::new(""));
+        if let Ok(relative) = real.join(tail).strip_prefix(&self.inner.root)
+            && refused(relative)
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
     fn lock_mutations(&self) -> VaultResult<std::sync::MutexGuard<'_, ()>> {
         self.inner
             .mutations
@@ -872,7 +994,7 @@ impl Vault {
     }
 
     fn reindex(&self, path: &Path) -> VaultResult<()> {
-        let actual_path = self.canonical_existing_relative_path(path)?;
+        let actual_path = path::resolve_existing(&self.inner.root, path)?.relative;
         let mut idx = self.write_index();
         let result = idx.refresh_file(
             &self.inner.root,
@@ -2172,5 +2294,180 @@ mod tests {
         assert!(vault.search_by_tag("work/inbox").unwrap().is_empty());
         vault.delete_note(Path::new("a.md")).unwrap();
         assert!(vault.search_by_tag("work").unwrap().is_empty());
+    }
+
+    // ── folder scope ───────────────────────────────────────────────────
+
+    async fn scoped_vault(deny: &[&str], allow: &[&str]) -> (tempfile::TempDir, Vault) {
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_helpers::create_test_vault(dir.path());
+        for path in ["Secret/a.md", "Open/a.md"] {
+            std::fs::create_dir_all(dir.path().join(path).parent().unwrap()).unwrap();
+            std::fs::write(dir.path().join(path), "# A\nbody [[a]]\n").unwrap();
+        }
+        let owned = |patterns: &[&str]| patterns.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let scope = PathScope::build(&owned(deny), &owned(allow)).unwrap();
+        let config = crate::test_helpers::test_config(dir.path());
+        let vault = Vault::open_scoped(&config, scope).await.unwrap();
+        (dir, vault)
+    }
+
+    fn assert_denied<T: std::fmt::Debug>(result: VaultResult<T>) {
+        assert!(
+            matches!(result, Err(VaultError::AccessDenied(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_refuses_a_denied_note_in_any_spelling() {
+        let (_dir, vault) = scoped_vault(&["Secret/"], &[]).await;
+        assert_denied(vault.read_note(Path::new("Secret/a.md")));
+        assert_denied(vault.read_note(Path::new("secret/a.md")));
+        assert_denied(vault.read_note(Path::new("Open/../SECRET/A.md")));
+        assert_denied(vault.read_note(Path::new("Secret/missing.md")));
+        assert!(vault.read_note(Path::new("Open/a.md")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn scope_refuses_every_mutation_and_both_ends_of_a_move() {
+        let (dir, vault) = scoped_vault(&["Secret/"], &[]).await;
+        let secret = Path::new("Secret/a.md");
+        assert_denied(vault.write_note(secret, "x"));
+        assert_denied(vault.append_note(secret, "x"));
+        assert_denied(vault.prepend_note(secret, "x"));
+        assert_denied(vault.create_note(Path::new("secret/new.md"), "x", None));
+        assert_denied(vault.delete_note(secret));
+        assert_denied(vault.set_frontmatter_field(secret, "k", serde_json::json!(1)));
+        assert_denied(vault.remove_frontmatter_field(secret, "k"));
+        assert_denied(vault.move_note(secret, Path::new("Open/out.md")));
+        assert_denied(vault.move_note(Path::new("Open/a.md"), Path::new("Secret/in.md")));
+        assert_denied(vault.get_note_metadata(secret));
+        assert_denied(vault.file_stat(secret));
+        assert_denied(vault.backlinks(secret));
+        assert_denied(vault.list_files(Path::new("secret"), true, None));
+        // Renaming a folder would carry scoped-out subfolders with it.
+        assert_denied(vault.move_note(Path::new("Open"), Path::new("Moved")));
+        assert!(dir.path().join("Open").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(secret)).unwrap(),
+            "# A\nbody [[a]]\n"
+        );
+        assert!(!dir.path().join("Secret/new.md").exists());
+        assert!(!dir.path().join("Secret/in.md").exists());
+        assert!(dir.path().join("Open/a.md").exists());
+    }
+
+    #[tokio::test]
+    async fn scope_hides_denied_notes_from_listing_and_search() {
+        let (_dir, vault) = scoped_vault(&["Secret/"], &[]).await;
+        assert_eq!(
+            vault.list_files(Path::new(""), true, None).unwrap(),
+            [PathBuf::from("Open"), PathBuf::from("Open/a.md")]
+        );
+        let hits = vault.search_text("body", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, Path::new("Open/a.md"));
+        assert_eq!(vault.indexed_paths(), ["Open/a.md"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scope_follows_a_symlink_into_a_denied_folder() {
+        let (dir, vault) = scoped_vault(&["Secret/"], &[]).await;
+        std::os::unix::fs::symlink(dir.path().join("Secret"), dir.path().join("Open/door"))
+            .unwrap();
+        assert_denied(vault.read_note(Path::new("Open/door/a.md")));
+        assert_denied(vault.create_note(Path::new("Open/door/new.md"), "x", None));
+        assert!(!dir.path().join("Secret/new.md").exists());
+    }
+
+    #[tokio::test]
+    async fn scope_refuses_hidden_folders() {
+        let (dir, vault) = scoped_vault(&["Secret/"], &[]).await;
+        std::fs::create_dir_all(dir.path().join(".trash/Secret")).unwrap();
+        std::fs::write(dir.path().join(".trash/Secret/a.md"), "deleted").unwrap();
+        std::fs::write(dir.path().join(".obsidian/workspace.json"), "{}").unwrap();
+        assert_denied(vault.read_note(Path::new(".trash/Secret/a.md")));
+        assert_denied(vault.read_note(Path::new(".obsidian/workspace.json")));
+        assert_denied(vault.write_note(Path::new(".obsidian/daily-notes.json"), "{}"));
+        assert_denied(vault.list_files(Path::new(".trash"), true, None));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scope_refuses_a_write_through_a_dangling_symlink() {
+        let (dir, vault) = scoped_vault(&["Secret/"], &[]).await;
+        std::os::unix::fs::symlink(
+            dir.path().join("Secret/planted.md"),
+            dir.path().join("Open/link.md"),
+        )
+        .unwrap();
+        assert_denied(vault.write_note(Path::new("Open/link.md"), "x"));
+        assert!(!dir.path().join("Secret/planted.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn scope_does_not_index_a_symlink_into_a_denied_folder() {
+        let (dir, vault) = scoped_vault(&["Secret/"], &[]).await;
+        std::os::unix::fs::symlink(
+            dir.path().join("Secret/a.md"),
+            dir.path().join("Open/alias.md"),
+        )
+        .unwrap();
+        assert!(vault.inner.exclude.is_excluded(Path::new("Open/alias.md")));
+        // A trashed copy is as out of reach as the folder it came from.
+        std::fs::create_dir_all(dir.path().join(".trash")).unwrap();
+        std::fs::write(dir.path().join(".trash/old.md"), "deleted").unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join(".trash/old.md"),
+            dir.path().join("Open/trashed.md"),
+        )
+        .unwrap();
+        assert!(
+            vault
+                .inner
+                .exclude
+                .is_excluded(Path::new("Open/trashed.md"))
+        );
+        assert_eq!(
+            vault.list_files(Path::new("Open"), false, None).unwrap(),
+            [PathBuf::from("Open/a.md")]
+        );
+        assert!(!vault.inner.exclude.is_excluded(Path::new("Open/a.md")));
+    }
+
+    #[tokio::test]
+    async fn scope_filters_periodic_notes_listed_from_an_unnormalized_folder() {
+        let (dir, vault) = scoped_vault(&["Secret/"], &[]).await;
+        std::fs::write(dir.path().join("Secret/2026-09-30.md"), "").unwrap();
+        std::fs::write(
+            dir.path().join(".obsidian/daily-notes.json"),
+            r#"{"folder":"./Secret","format":"YYYY-MM-DD"}"#,
+        )
+        .unwrap();
+        assert!(
+            vault
+                .list_recent_periodic_notes(&NotePeriod::Daily, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_list_refuses_everything_outside_it() {
+        let (_dir, vault) = scoped_vault(&[], &["Open/"]).await;
+        assert!(vault.read_note(Path::new("Open/a.md")).is_ok());
+        assert_denied(vault.read_note(Path::new("Secret/a.md")));
+        assert_denied(vault.create_note(Path::new("root.md"), "x", None));
+        // No existence oracle: a folder outside the list answers the same
+        // whether or not it exists.
+        assert_denied(vault.list_files(Path::new("Secret"), false, None));
+        assert_denied(vault.list_files(Path::new("Nowhere"), false, None));
+        assert_eq!(
+            vault.list_files(Path::new(""), true, None).unwrap(),
+            [PathBuf::from("Open"), PathBuf::from("Open/a.md")]
+        );
     }
 }

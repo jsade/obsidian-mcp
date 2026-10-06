@@ -106,7 +106,7 @@ impl VaultIndex {
                         );
                     }
                 }
-            } else {
+            } else if !exclude.is_out_of_scope(&rel_path) {
                 non_md_file_count += 1;
                 if let Ok(meta) = entry.metadata() {
                     non_md_bytes += meta.len();
