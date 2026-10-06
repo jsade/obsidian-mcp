@@ -628,6 +628,13 @@ fn comma_list_env(name: &str) -> Vec<String> {
         .collect()
 }
 
+/// Extra `Host` names the HTTP transport accepts, from
+/// `OBSIDIAN_HTTP_ALLOWED_HOSTS`: `example.com` for any port,
+/// `example.com:8443` for one.
+pub fn allowed_hosts_from_env() -> Vec<String> {
+    comma_list_env("OBSIDIAN_HTTP_ALLOWED_HOSTS")
+}
+
 /// Folder scope patterns from `OBSIDIAN_DENY_PATHS` and `OBSIDIAN_ALLOW_PATHS`.
 ///
 /// Kept out of [`Config`]: unlike the exclude list, these bound what any
