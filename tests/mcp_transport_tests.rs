@@ -1459,3 +1459,109 @@ async fn a_scoped_server_stays_off_the_semantic_daemon() {
     assert!(log.contains("semantic_mode=\"local\""), "{log}");
     assert!(log.contains("daemon_ready=false"), "{log}");
 }
+
+// ── Unix socket listener ──
+
+/// Start a server listening on `socket`, and wait until it accepts.
+#[cfg(unix)]
+async fn start_on_socket(vault: &TempDir, socket: &std::path::Path) -> Child {
+    let mut child = server_command(vault)
+        .arg("--http")
+        .env("OBSIDIAN_HTTP_SOCKET", socket)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while tokio::net::UnixStream::connect(socket).await.is_err() {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("server exited before listening: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "server did not listen on the socket"
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+    child
+}
+
+/// Status line of `GET /health` sent over the socket.
+#[cfg(unix)]
+async fn socket_health(socket: &std::path::Path) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.unwrap();
+    response.lines().next().unwrap_or_default().to_string()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn http_serves_on_a_socket_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let vault = temporary_vault();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("mcp.sock");
+
+    let mut child = start_on_socket(&vault, &socket).await;
+
+    assert_eq!(socket_health(&socket).await, "HTTP/1.1 200 OK");
+    let mode = std::fs::metadata(&socket).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o660);
+
+    // A graceful stop removes the socket file.
+    let pid = child.id().unwrap().to_string();
+    std::process::Command::new("kill")
+        .args(["-TERM", &pid])
+        .status()
+        .unwrap();
+    timeout(Duration::from_secs(10), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!socket.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn http_replaces_a_stale_socket_file() {
+    let vault = temporary_vault();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("mcp.sock");
+
+    // A server stopped with SIGKILL leaves its socket behind.
+    let mut first = start_on_socket(&vault, &socket).await;
+    first.start_kill().unwrap();
+    first.wait().await.unwrap();
+    assert!(socket.exists());
+
+    let _second = start_on_socket(&vault, &socket).await;
+    assert_eq!(socket_health(&socket).await, "HTTP/1.1 200 OK");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn http_refuses_a_socket_path_that_is_another_file() {
+    let vault = temporary_vault();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp.sock");
+    std::fs::write(&path, "keep me").unwrap();
+
+    let status = timeout(
+        Duration::from_secs(30),
+        server_command(&vault)
+            .arg("--http")
+            .env("OBSIDIAN_HTTP_SOCKET", &path)
+            .stderr(Stdio::null())
+            .status(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    assert!(!status.success());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+}

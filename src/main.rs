@@ -116,7 +116,10 @@ async fn serve_http(
     let mut mcp_config = StreamableHttpServerConfig::default();
     mcp_config.legacy_session_mode = true;
     mcp_config.json_response = true;
-    allow_bind_host(&mut mcp_config, config.http_host);
+    let socket = obsidian_mcp::config::http_socket_from_env();
+    if socket.is_none() {
+        allow_bind_host(&mut mcp_config, config.http_host);
+    }
     let extra_hosts = obsidian_mcp::config::allowed_hosts_from_env();
     // Read here rather than into `Config`, which derives `Debug`.
     let tokens = obsidian_mcp::http_auth::TokenSet::from_env()?;
@@ -186,6 +189,10 @@ async fn serve_http(
         .route("/health", get(move || health_handler(health_vault.clone())))
         .merge(mcp_router);
 
+    if let Some(socket) = socket {
+        return serve_on_socket(&socket, app).await;
+    }
+
     let addr = std::net::SocketAddr::new(config.http_host, config.http_port);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP MCP server listening");
@@ -195,6 +202,49 @@ async fn serve_http(
         .await?;
 
     Ok(())
+}
+
+/// Serve on a Unix socket file. A socket left at the path by an earlier run is
+/// replaced; any other file there is refused. Mode 0660 lets the owner and its
+/// group connect; the directory holding the socket decides who else can.
+#[cfg(unix)]
+async fn serve_on_socket(
+    socket: &std::path::Path,
+    app: axum::Router,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+
+    match std::fs::symlink_metadata(socket) {
+        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(socket)?,
+        Ok(_) => {
+            return Err(format!(
+                "OBSIDIAN_HTTP_SOCKET: {} exists and is not a socket",
+                socket.display()
+            )
+            .into());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let listener = tokio::net::UnixListener::bind(socket)?;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
+    tracing::info!(socket = %socket.display(), "HTTP MCP server listening");
+
+    let served = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+    if let Err(error) = std::fs::remove_file(socket) {
+        tracing::warn!(socket = %socket.display(), %error, "cannot remove socket file");
+    }
+    Ok(served?)
+}
+
+#[cfg(not(unix))]
+async fn serve_on_socket(
+    _socket: &std::path::Path,
+    _app: axum::Router,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("OBSIDIAN_HTTP_SOCKET needs a Unix system".into())
 }
 
 /// rmcp accepts only loopback `Host` headers by default. A server bound to a
@@ -487,9 +537,18 @@ async fn handle_cli_flags() -> Option<i32> {
                 print_help();
                 return Some(0);
             }
-            let result = match arg.as_str() {
-                "stop" => stop_server(),
-                _ => daemonize(),
+            // These find the server by its TCP port.
+            let result = if obsidian_mcp::config::http_socket_from_env().is_some() {
+                Err(format!(
+                    "'{arg}' manages a server on a TCP port; unset OBSIDIAN_HTTP_SOCKET \
+                     or run the socket server under a service manager"
+                )
+                .into())
+            } else {
+                match arg.as_str() {
+                    "stop" => stop_server(),
+                    _ => daemonize(),
+                }
             };
             match result {
                 Ok(()) => Some(0),
@@ -539,7 +598,8 @@ fn print_help() {
              OBSIDIAN_TRANSPORT      Transport: stdio | http        [default: stdio]\n    \
              OBSIDIAN_HTTP_PORT      HTTP listen port               [default: 37842]\n    \
              OBSIDIAN_HTTP_HOST      HTTP bind address              [default: 127.0.0.1]\n    \
-             OBSIDIAN_HTTP_AUTH_TOKEN  Require this bearer token on /mcp  [default: none]\n    \
+             OBSIDIAN_HTTP_SOCKET    Listen on this Unix socket file instead  [default: none]\n    \
+             OBSIDIAN_HTTP_AUTH_TOKEN Require this bearer token on /mcp  [default: none]\n    \
              OBSIDIAN_HTTP_AUTH_TOKENS_FILE  Named tokens, name:sha256 per line  [default: none]\n    \
              OBSIDIAN_HTTP_ALLOWED_HOSTS  Extra Host names to accept  [default: none]\n    \
              OBSIDIAN_WATCH          Enable filesystem watcher      [default: true]\n    \
