@@ -232,10 +232,32 @@ async fn serve_on_socket(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(refuse(&error.to_string())),
     }
-    let listener = tokio::net::UnixListener::bind(socket)
-        .map_err(|error| refuse(&format!("cannot listen: {error}")))?;
-    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
-    let ours = std::fs::symlink_metadata(socket).map(|meta| (meta.dev(), meta.ino()))?;
+    // Bind inside a fresh 0700 directory, set the mode there, then rename the
+    // socket into place. Binding at the final path would leave the socket
+    // reachable with the umask's mode until the chmod, and a client that
+    // connects in that window stays connected.
+    let parent = socket
+        .parent()
+        .ok_or_else(|| refuse("has no parent folder"))?;
+    let staging = parent.join(format!(".obsidian-mcp-{}", std::process::id()));
+    let staged = staging.join("s");
+    // A crashed run with the same process ID may have left these behind.
+    let _ = std::fs::remove_file(&staged);
+    let _ = std::fs::remove_dir(&staging);
+    std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
+        .create(&staging)
+        .map_err(|error| refuse(&format!("cannot create {}: {error}", staging.display())))?;
+    let bound = (|| {
+        let listener = tokio::net::UnixListener::bind(&staged)
+            .map_err(|error| refuse(&format!("cannot listen: {error}")))?;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o660))?;
+        let meta = std::fs::symlink_metadata(&staged)?;
+        std::fs::rename(&staged, socket)?;
+        Ok::<_, Box<dyn std::error::Error>>((listener, (meta.dev(), meta.ino())))
+    })();
+    let _ = std::fs::remove_file(&staged);
+    let _ = std::fs::remove_dir(&staging);
+    let (listener, ours) = bound?;
     tracing::info!(socket = %socket.display(), "HTTP MCP server listening");
 
     let served = axum::serve(listener, app)
