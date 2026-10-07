@@ -97,9 +97,16 @@ impl PathScope {
             }
             let globs = [base.to_string(), format!("{base}/**")];
             for glob in globs {
-                let compiled = GlobBuilder::new(&glob).build().map_err(|e| {
-                    VaultError::InvalidPath(format!("invalid scope pattern '{trimmed}': {e}"))
-                })?;
+                // globset turns `\` escapes off on Windows, where `\` is a path
+                // separator. Scope keys always use `/`, and the README promises
+                // `\[` for a literal bracket, so keep escapes on everywhere: a
+                // deny pattern that matched nothing would expose its folder.
+                let compiled = GlobBuilder::new(&glob)
+                    .backslash_escape(true)
+                    .build()
+                    .map_err(|e| {
+                        VaultError::InvalidPath(format!("invalid scope pattern '{trimmed}': {e}"))
+                    })?;
                 // `*` crosses `/`, so `*`, `*/**` or `*.md` name no folder at all.
                 let matcher = compiled.compile_matcher();
                 if WHOLE_VAULT_PROBES
