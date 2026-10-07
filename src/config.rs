@@ -635,6 +635,12 @@ pub fn allowed_hosts_from_env() -> Vec<String> {
     comma_list_env("OBSIDIAN_HTTP_ALLOWED_HOSTS")
 }
 
+/// Socket file the HTTP transport listens on instead of a TCP port, from
+/// `OBSIDIAN_HTTP_SOCKET`. Unset or empty means TCP.
+pub fn http_socket_from_env() -> Option<PathBuf> {
+    normalize_optional_path_env("OBSIDIAN_HTTP_SOCKET")
+}
+
 /// Folder scope patterns from `OBSIDIAN_DENY_PATHS` and `OBSIDIAN_ALLOW_PATHS`.
 ///
 /// Kept out of [`Config`]: unlike the exclude list, these bound what any
