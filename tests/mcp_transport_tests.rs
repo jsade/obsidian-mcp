@@ -972,6 +972,196 @@ async fn a_missing_token_file_stops_the_server() {
     assert!(!status.success());
 }
 
+// ── Source-address allow-list ──
+
+const SOURCE_TOKEN: &str = "source-test-token";
+
+/// Status of `server/discover` sent with these `X-Forwarded-For` lines and,
+/// when `token` is true, a valid bearer token.
+async fn source_status(server: &HttpServer, forwarded: &[&str], token: bool) -> StatusCode {
+    let mut request = server.request("server/discover", json!({}), MODERN);
+    for value in forwarded {
+        request = request.header("X-Forwarded-For", *value);
+    }
+    if token {
+        request = request.header("Authorization", format!("Bearer {SOURCE_TOKEN}"));
+    }
+    request.send().await.unwrap().status()
+}
+
+#[tokio::test]
+async fn only_listed_sources_reach_the_token_check() {
+    let config = tempfile::tempdir().unwrap();
+    let log_path = config.path().join("server.log");
+    // Loopback is listed so the start-up probe, which sends no header, passes.
+    let server = HttpServer::start_logging_to(
+        "full",
+        "127.0.0.1",
+        &[
+            (
+                "OBSIDIAN_HTTP_ALLOWED_SOURCES",
+                "127.0.0.1/32, 203.0.113.0/24, 2001:db8::/32",
+            ),
+            ("OBSIDIAN_HTTP_AUTH_TOKEN", SOURCE_TOKEN),
+            ("OBSIDIAN_LOG_LEVEL", "warn"),
+        ],
+        |_| {},
+        Some(&log_path),
+    )
+    .await;
+
+    for (forwarded, expected) in [
+        // Inside the list.
+        (&["203.0.113.5"][..], StatusCode::OK),
+        (&["2001:db8::7"][..], StatusCode::OK),
+        // No header: the loopback peer is the source.
+        (&[][..], StatusCode::OK),
+        // Outside the list.
+        (&["198.51.100.7"][..], StatusCode::FORBIDDEN),
+        (&["2001:db9::7"][..], StatusCode::FORBIDDEN),
+        // A loopback peer does not let an outside header through.
+        (&["127.0.0.2"][..], StatusCode::FORBIDDEN),
+        // Malformed.
+        (&["garbage"][..], StatusCode::FORBIDDEN),
+        (&["203.0.113.5:443"][..], StatusCode::FORBIDDEN),
+        (&["203.0.113.5,"][..], StatusCode::FORBIDDEN),
+        // The last value counts: an allowed first value the client wrote
+        // does not pass.
+        (&["203.0.113.5, 198.51.100.7"][..], StatusCode::FORBIDDEN),
+        (&["198.51.100.7, 203.0.113.5"][..], StatusCode::OK),
+        (&["203.0.113.5", "198.51.100.7"][..], StatusCode::FORBIDDEN),
+        (&["198.51.100.7", "203.0.113.5"][..], StatusCode::OK),
+    ] {
+        assert_eq!(
+            source_status(&server, forwarded, true).await,
+            expected,
+            "{forwarded:?}"
+        );
+    }
+
+    // A refused source gets 403 without a token, before authentication; an
+    // allowed one without a token still gets 401.
+    assert_eq!(
+        source_status(&server, &["198.51.100.7"], false).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        source_status(&server, &["203.0.113.5"], false).await,
+        StatusCode::UNAUTHORIZED
+    );
+    // `/health` is behind the list too.
+    let health = |forwarded: &'static str| {
+        server
+            .client
+            .get(format!("{}/health", server.url))
+            .header("X-Forwarded-For", forwarded)
+            .send()
+    };
+    assert_eq!(
+        health("198.51.100.7").await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        health("203.0.113.5").await.unwrap().status(),
+        StatusCode::OK
+    );
+    server.stop().await;
+
+    // One warn line per refusal, naming the source and nothing secret.
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    let refusals: Vec<_> = log
+        .lines()
+        .filter(|line| line.contains("refused"))
+        .collect();
+    assert_eq!(refusals.len(), 10, "{log}");
+    assert!(refusals.iter().all(|line| line.contains("WARN")), "{log}");
+    assert!(
+        refusals
+            .iter()
+            .any(|line| line.contains("source=198.51.100.7")),
+        "{log}"
+    );
+    assert!(
+        refusals
+            .iter()
+            .any(|line| line.contains("source=2001:db9::7")),
+        "{log}"
+    );
+    assert!(!log.contains(SOURCE_TOKEN), "{log}");
+    assert!(!log.contains("garbage"), "{log}");
+}
+
+#[tokio::test]
+async fn without_the_allow_list_forwarded_addresses_change_nothing() {
+    let server = HttpServer::start_with("full", "127.0.0.1", Some(SOURCE_TOKEN)).await;
+    for forwarded in [&["198.51.100.7"][..], &["garbage"][..], &[][..]] {
+        assert_eq!(
+            source_status(&server, forwarded, true).await,
+            StatusCode::OK,
+            "{forwarded:?}"
+        );
+    }
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn without_the_header_a_peer_outside_the_list_is_refused() {
+    // The server's peer is always loopback here, so list only another range.
+    let vault = temporary_vault();
+    let port = free_port("127.0.0.1");
+    let mut child = server_command(&vault)
+        .args(["--http", "--port", &port.to_string()])
+        .env("OBSIDIAN_HTTP_ALLOWED_SOURCES", "203.0.113.0/24")
+        .spawn()
+        .unwrap();
+    let client = Client::builder().no_proxy().build().unwrap();
+    let url = format!("http://127.0.0.1:{port}/health");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        assert!(child.try_wait().unwrap().is_none(), "server exited");
+        match client.get(&url).send().await {
+            Ok(response) => break response.status(),
+            Err(_) if Instant::now() < deadline => sleep(Duration::from_millis(25)).await,
+            Err(error) => panic!("server did not answer: {error}"),
+        }
+    };
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let response = client
+        .get(&url)
+        .header("X-Forwarded-For", "203.0.113.5")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    child.kill().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_invalid_source_entry_stops_the_server() {
+    for value in [
+        "203.0.113.0/33",
+        "203.0.113.0/",
+        "example.com",
+        "203.0.113.5/24",
+        "203.0.113.0/24, nonsense",
+    ] {
+        let vault = temporary_vault();
+        let output = server_command(&vault)
+            .args(["--http", "--port", &free_port("127.0.0.1").to_string()])
+            .env("OBSIDIAN_HTTP_ALLOWED_SOURCES", value)
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success(), "{value}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("OBSIDIAN_HTTP_ALLOWED_SOURCES"),
+            "{value}: {stderr}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn every_write_is_logged_with_the_token_name_tool_and_path() {
     let config = tempfile::tempdir().unwrap();
@@ -1465,9 +1655,19 @@ async fn a_scoped_server_stays_off_the_semantic_daemon() {
 /// Start a server listening on `socket`, and wait until it accepts.
 #[cfg(unix)]
 async fn start_on_socket(vault: &TempDir, socket: &std::path::Path) -> Child {
+    start_on_socket_with(vault, socket, &[]).await
+}
+
+#[cfg(unix)]
+async fn start_on_socket_with(
+    vault: &TempDir,
+    socket: &std::path::Path,
+    env: &[(&str, &str)],
+) -> Child {
     let mut child = server_command(vault)
         .arg("--http")
         .env("OBSIDIAN_HTTP_SOCKET", socket)
+        .envs(env.iter().copied())
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -1523,6 +1723,38 @@ async fn http_serves_on_a_socket_file() {
         .unwrap()
         .unwrap();
     assert!(!socket.exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn on_a_socket_a_request_without_the_header_is_refused() {
+    use tokio::io::AsyncReadExt;
+    let vault = temporary_vault();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("mcp.sock");
+    let mut child = start_on_socket_with(
+        &vault,
+        &socket,
+        &[("OBSIDIAN_HTTP_ALLOWED_SOURCES", "203.0.113.0/24")],
+    )
+    .await;
+    let status = async |forwarded: Option<&str>| {
+        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let header = forwarded
+            .map(|value| format!("X-Forwarded-For: {value}\r\n"))
+            .unwrap_or_default();
+        let request =
+            format!("GET /health HTTP/1.1\r\nHost: localhost\r\n{header}Connection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response.lines().next().unwrap_or_default().to_string()
+    };
+    // A socket has no peer address to fall back on.
+    assert_eq!(status(None).await, "HTTP/1.1 403 Forbidden");
+    assert_eq!(status(Some("198.51.100.7")).await, "HTTP/1.1 403 Forbidden");
+    assert_eq!(status(Some("203.0.113.5")).await, "HTTP/1.1 200 OK");
+    child.kill().await.unwrap();
 }
 
 #[cfg(unix)]

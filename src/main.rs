@@ -130,6 +130,7 @@ async fn serve_http(
                 .into(),
         );
     }
+    let sources = obsidian_mcp::http_source::SourceAllowList::from_env()?;
     let auth_required = tokens.is_some();
     if !extra_hosts.is_empty() {
         tracing::info!(hosts = ?extra_hosts, "additional Host names accepted");
@@ -185,9 +186,18 @@ async fn serve_http(
         tracing::info!("HTTP MCP endpoint requires a bearer token");
     }
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(move || health_handler(health_vault.clone())))
         .merge(mcp_router);
+    // Outermost, so a refused source reaches neither the token check, the
+    // `Host` check nor `/health`.
+    if let Some(sources) = sources {
+        tracing::info!(sources = ?sources.describe(), "HTTP requests limited to these sources");
+        app = app.layer(middleware::from_fn_with_state(
+            Arc::new(sources),
+            source_allow_list_middleware,
+        ));
+    }
 
     if let Some(socket) = socket {
         return serve_on_socket(&socket, app).await;
@@ -197,9 +207,12 @@ async fn serve_http(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "HTTP MCP server listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     Ok(())
 }
@@ -302,6 +315,39 @@ fn allow_bind_host(
     if !bind.is_loopback() && !bind.is_unspecified() {
         mcp_config.allowed_hosts.push(bind.to_string());
     }
+}
+
+/// Refuse a request whose source address is not on the allow-list: the last
+/// `X-Forwarded-For` value, else the TCP peer. A Unix socket has no peer
+/// address, so there a request without the header is refused.
+async fn source_allow_list_middleware(
+    axum::extract::State(sources): axum::extract::State<
+        Arc<obsidian_mcp::http_source::SourceAllowList>,
+    >,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use obsidian_mcp::http_source::{NoSource, request_source};
+
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip());
+    match request_source(request.headers(), peer) {
+        Ok(source) if sources.allows(source) => return next.run(request).await,
+        Ok(source) => {
+            tracing::warn!(%source, "refused HTTP request from a source outside the allow-list");
+        }
+        // The header's text is the client's, so it is not logged.
+        Err(NoSource::Unparsable) => {
+            tracing::warn!("refused HTTP request whose X-Forwarded-For is not an address");
+        }
+        Err(NoSource::Unknown) => {
+            tracing::warn!("refused HTTP request with no X-Forwarded-For and no peer address");
+        }
+    }
+    (axum::http::StatusCode::FORBIDDEN, "Forbidden").into_response()
 }
 
 struct HttpAuth {
@@ -647,6 +693,7 @@ fn print_help() {
              OBSIDIAN_HTTP_AUTH_TOKEN  Require this bearer token on /mcp  [default: none]\n    \
              OBSIDIAN_HTTP_AUTH_TOKENS_FILE  Named tokens, name:sha256 per line  [default: none]\n    \
              OBSIDIAN_HTTP_ALLOWED_HOSTS  Extra Host names to accept  [default: none]\n    \
+             OBSIDIAN_HTTP_ALLOWED_SOURCES  Source CIDRs to serve, others get 403  [default: any]\n    \
              OBSIDIAN_WATCH          Enable filesystem watcher      [default: true]\n    \
              OBSIDIAN_LOG_LEVEL      Tracing log level              [default: info]\n    \
              OBSIDIAN_TANTIVY        Enable BM25 full-text index    [default: true]\n    \
