@@ -262,7 +262,7 @@ fn read_json_config<T: serde::de::DeserializeOwned>(path: &Path) -> VaultResult<
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         // A `.obsidian` closed to the server's account means the defaults.
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            tracing::debug!(path = %path.display(), "config not readable, using defaults");
+            tracing::warn!(path = %path.display(), "config not readable, using defaults");
             return Ok(None);
         }
         Err(e) => return Err(VaultError::Io(e)),

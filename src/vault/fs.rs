@@ -21,6 +21,17 @@ fn is_hidden(name: &str) -> bool {
     name.starts_with('.')
 }
 
+/// Whether a walk may skip the entry behind this error: one the server's
+/// account may not read, or one removed while the walk ran.
+pub(crate) fn is_skippable_walk_error(error: &walkdir::Error) -> bool {
+    error.io_error().is_some_and(|io| {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+        )
+    })
+}
+
 fn map_not_found(path: &Path) -> impl FnOnce(std::io::Error) -> VaultError + '_ {
     |e| match e.kind() {
         std::io::ErrorKind::NotFound => VaultError::NoteNotFound(path.to_path_buf()),
@@ -202,8 +213,8 @@ pub fn list_files(
             let entry = match entry {
                 Ok(entry) => entry,
                 // A folder below the listed one that cannot be read is left out.
-                Err(e) if e.io_error().is_some() && e.path().is_some_and(|p| p != abs_dir) => {
-                    tracing::warn!(error = %e, "skipping unreadable path in listing");
+                Err(e) if is_skippable_walk_error(&e) && e.path().is_some_and(|p| p != abs_dir) => {
+                    tracing::debug!(error = %e, "skipping unreadable path in listing");
                     continue;
                 }
                 Err(e) => return Err(VaultError::Io(std::io::Error::other(e.to_string()))),

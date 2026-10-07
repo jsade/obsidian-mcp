@@ -62,7 +62,7 @@ impl VaultIndex {
         let mut non_md_bytes: u64 = 0;
         let mut excluded_note_paths: HashSet<PathBuf> = HashSet::new();
 
-        // A folder the scope denies is not opened at all.
+        // A folder the scope denies is not listed or descended into.
         let walker = WalkDir::new(vault_root)
             .min_depth(1)
             .into_iter()
@@ -76,21 +76,17 @@ impl VaultIndex {
         for entry in walker {
             let entry = match entry {
                 Ok(entry) => entry,
-                // A folder the server may not read is skipped, so one closed
-                // folder cannot stop the server.
-                // The vault root itself must stay readable.
+                // A folder the server may not read (or that vanished during
+                // the walk) is skipped, so one closed folder cannot stop the
+                // server. The vault root itself must stay readable.
                 Err(e)
-                    if e.io_error().is_some()
+                    if fs::is_skippable_walk_error(&e)
                         && e.path().is_some_and(|path| path != vault_root) =>
                 {
                     let path = e.path().unwrap_or(vault_root);
                     let rel = vault_path::relative_from_absolute(vault_root, path)
                         .unwrap_or_else(|_| path.to_path_buf());
-                    if exclude.is_out_of_scope(&rel) {
-                        tracing::info!(path = %rel.display(), error = %e, "skipping unreadable path outside the folder scope");
-                    } else {
-                        tracing::warn!(path = %rel.display(), error = %e, "skipping unreadable path during index build");
-                    }
+                    tracing::warn!(path = %rel.display(), error = %e, "skipping unreadable path during index build");
                     continue;
                 }
                 Err(e) => {
@@ -996,7 +992,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn build_does_not_open_a_denied_folder() {
+    async fn build_does_not_descend_into_a_denied_folder() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().canonicalize().unwrap();
         stdfs::create_dir_all(root.join("Private")).unwrap();
@@ -1008,7 +1004,7 @@ mod tests {
             .unwrap();
 
         assert!(index.get_note(Path::new("top.md")).is_some());
-        // Not opened, so not even counted as excluded.
+        // Not descended into, so not even counted as excluded.
         assert_eq!(index.excluded_notes(), 0);
     }
 
