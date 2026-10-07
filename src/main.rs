@@ -239,11 +239,16 @@ async fn serve_on_socket(
     let parent = socket
         .parent()
         .ok_or_else(|| refuse("has no parent folder"))?;
-    let staging = parent.join(format!(".obsidian-mcp-{}", std::process::id()));
+    // An unguessable name, and nothing removed before it is created: a name
+    // planted in advance makes `create` fail instead of being followed.
+    let nonce = {
+        use std::hash::{BuildHasher, Hasher};
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        hasher.finish()
+    };
+    let staging = parent.join(format!(".obsidian-mcp-{nonce:016x}"));
     let staged = staging.join("s");
-    // A crashed run with the same process ID may have left these behind.
-    let _ = std::fs::remove_file(&staged);
-    let _ = std::fs::remove_dir(&staging);
     std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700)
         .create(&staging)
         .map_err(|error| refuse(&format!("cannot create {}: {error}", staging.display())))?;
@@ -255,7 +260,11 @@ async fn serve_on_socket(
         std::fs::rename(&staged, socket)?;
         Ok::<_, Box<dyn std::error::Error>>((listener, (meta.dev(), meta.ino())))
     })();
-    let _ = std::fs::remove_file(&staged);
+    // After a rename the folder is empty. Only a failed bind or rename leaves
+    // the socket in it. `remove_dir` does not follow a symlink.
+    if bound.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
     let _ = std::fs::remove_dir(&staging);
     let (listener, ours) = bound?;
     tracing::info!(socket = %socket.display(), "HTTP MCP server listening");

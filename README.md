@@ -260,7 +260,7 @@ OBSIDIAN_HTTP_SOCKET=/Users/vault/run/mcp.sock obsidian-mcp --http /path/to/vaul
 Point the proxy or tunnel at the socket file, for example a `unix:` target.
 
 - The path must be absolute and short: macOS allows 104 bytes, Linux 108. `OBSIDIAN_HTTP_HOST` and `OBSIDIAN_HTTP_PORT` are ignored, and no TCP port is opened.
-- The socket gets mode `0660`: its owner and its group can connect. The group is the directory's on macOS, and the process's on Linux unless the directory is setgid. Give the directory to the server's account with the proxy's group and mode `0750`: the proxy needs to enter it, not write to it.
+- The socket gets mode `0660`: its owner and its group can connect. The group is the directory's on macOS, and the process's on Linux unless the directory is setgid. Give the directory to the server's account with the proxy's group and mode `0750`: the proxy needs to enter it, not write to it. Any account that can write to the directory can replace the socket, so no one but the server's account should be able to. The server briefly creates a private `.obsidian-mcp-…` folder there while it starts.
 - A socket left at the path by a server that is gone is replaced. The server refuses to start if another server is listening on the socket, or if any other file is at the path; it leaves that file as it is.
 - On a graceful stop the server removes the socket, unless the file at the path is no longer its own.
 - The `Host` and token rules do not change. A proxy that forwards a public name still needs that name in `OBSIDIAN_HTTP_ALLOWED_HOSTS`.
