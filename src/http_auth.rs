@@ -71,6 +71,7 @@ impl TokenSet {
                     "OBSIDIAN_HTTP_AUTH_TOKEN"
                         | "OBSIDIAN_HTTP_AUTH_TOKENS_FILE"
                         | "OBSIDIAN_HTTP_ALLOWED_HOSTS"
+                        | "OBSIDIAN_HTTP_ALLOWED_SOURCES"
                 )
             {
                 tracing::warn!(variable = %key, "unknown HTTP access variable ignored");

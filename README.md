@@ -206,7 +206,7 @@ OBSIDIAN_TRANSPORT=http OBSIDIAN_HTTP_PORT=9000 obsidian-mcp /path/to/vault
 
 ### Exposing the HTTP endpoint
 
-By default the endpoint answers only requests whose `Host` header is a loopback name or the bind address, and it has no authentication. To put it behind a public name or a tunnel, set these three things. The server speaks plain HTTP, so terminate TLS in the tunnel or reverse proxy in front of it.
+By default the endpoint answers only requests whose `Host` header is a loopback name or the bind address, and it has no authentication. To put it behind a public name or a tunnel, use the settings below. The server speaks plain HTTP, so terminate TLS in the tunnel or reverse proxy in front of it.
 
 **Host names.** An authenticated `/mcp` request whose `Host` is not on the list gets 403. Because a public name opens the endpoint to other hosts, the server refuses to start with `OBSIDIAN_HTTP_ALLOWED_HOSTS` set and no token configured.
 
@@ -240,9 +240,22 @@ OBSIDIAN_HTTP_AUTH_TOKENS_FILE=/path/to/tokens obsidian-mcp --http /path/to/vaul
 - `outcome` is `ok` or `error`. Failed writes and writes the folder scope refuses are logged too. A call that never reaches the tool is not: a tool switched off with `OBSIDIAN_TOOLS`, or arguments the tool cannot parse.
 - `path` and `to` are cut at 512 characters.
 
+**Source addresses.** `OBSIDIAN_HTTP_ALLOWED_SOURCES` limits the endpoint to clients whose address is in one of the listed CIDR blocks. Any other request gets 403 before the token check, the `Host` check and `/health`. The variable is optional, works with or without a token, and unset or empty means every source is served, as before.
+
+```sh
+OBSIDIAN_HTTP_ALLOWED_SOURCES="203.0.113.0/24, 2001:db8::/32" obsidian-mcp --http /path/to/vault
+```
+
+- The source is the **last** `X-Forwarded-For` value when the request has that header, else the address of the connection. A proxy that appends to the header puts the address it saw last, so values before it are whatever the client sent and are ignored. When the header appears on several lines, the last value of the last line counts.
+- **The server trusts `X-Forwarded-For` as it arrives.** Any client that reaches the listener directly can send the header with an allowed address. Use the list only when the listener is reachable solely through a reverse proxy or tunnel that sets or appends that header on every request, for example a server on loopback or a socket file behind a proxy on the same machine for `vault.example.com`.
+- A request whose last value is not a plain IP address (a port, brackets, `unknown` or an empty value) gets 403. On a socket file there is no connection address, so a request without the header gets 403 too.
+- An entry is `address/prefix`, IPv4 or IPv6. A bare address means that one address. An IPv4-mapped IPv6 source (`::ffff:203.0.113.5`) matches the IPv4 block. An entry that does not parse, or has address bits set past its prefix (`203.0.113.5/24`), stops the server at startup.
+- Each refusal writes one line at `warn` level with the source address. When the header could not be read, the line says so and does not repeat its text.
+- `/health` is behind the list. `serve`, `restart` and `upgrade` check a server by requesting `/health` from loopback with no header, so list `127.0.0.1/32` (or `::1/128`) as well if you use them. That entry lets any local process past the list, so the token is then the only check for them.
+
 Before you expose a server:
 
-- Route only `/mcp` through the tunnel or proxy. `/health` answers without a token and without the `Host` check, and shows the version, the note count and the embedding status.
+- Route only `/mcp` through the tunnel or proxy. `/health` answers without a token and without the `Host` check (only to listed sources when `OBSIDIAN_HTTP_ALLOWED_SOURCES` is set), and shows the version, the note count and the embedding status.
 - Limit request rates in the tunnel or proxy. The server does not.
 - Keep `OBSIDIAN_LOG_LEVEL` at `info` or quieter. At `debug`, the log holds full tool arguments, note text included.
 - Switch off the tools the clients do not need, for example `OBSIDIAN_TOOLS='!open_in_obsidian'`, which would open the Obsidian app on the server's machine.
@@ -263,7 +276,7 @@ Point the proxy or tunnel at the socket file, for example a `unix:` target.
 - The socket gets mode `0660`: its owner and its group can connect. The group is the directory's on macOS, and the process's on Linux unless the directory is setgid. Give the directory to the server's account with the proxy's group and mode `0750`: the proxy needs to enter it, not write to it. Any account that can write to the directory can replace the socket, so no one but the server's account should be able to. The server briefly creates a private `.obsidian-mcp-…` folder there while it starts.
 - A socket left at the path by a server that is gone is replaced. The server refuses to start if another server is listening on the socket, or if any other file is at the path; it leaves that file as it is.
 - On a graceful stop the server removes the socket, unless the file at the path is no longer its own.
-- The `Host` and token rules do not change. A proxy that forwards a public name still needs that name in `OBSIDIAN_HTTP_ALLOWED_HOSTS`.
+- The `Host` and token rules do not change. A proxy that forwards a public name still needs that name in `OBSIDIAN_HTTP_ALLOWED_HOSTS`. With `OBSIDIAN_HTTP_ALLOWED_SOURCES` set, every request needs `X-Forwarded-For`, because a socket has no client address.
 - `serve`, `stop` and `restart` manage a server on a TCP port and refuse to run while `OBSIDIAN_HTTP_SOCKET` is set. Run a socket server under launchd or systemd. `upgrade` cannot check a socket server's health: after an upgrade, restart the service and check it yourself.
 
 ### Server Management
@@ -632,6 +645,7 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `OBSIDIAN_HTTP_AUTH_TOKEN` | No | *(none)* | When set, every `/mcp` request must send `Authorization: Bearer <token>` (401 otherwise). `/health` stays open |
 | `OBSIDIAN_HTTP_AUTH_TOKENS_FILE` | No | *(none)* | File of named tokens, one `name:sha256-hex` per line. Removing a line revokes that token without a restart. See [Exposing the HTTP endpoint](#exposing-the-http-endpoint) |
 | `OBSIDIAN_HTTP_ALLOWED_HOSTS` | No | *(none)* | Comma-separated extra `Host` names to accept, for a public name or a tunnel: `vault.example.com` (any port) or `vault.example.com:8443` |
+| `OBSIDIAN_HTTP_ALLOWED_SOURCES` | No | *(any)* | Comma-separated CIDR blocks, IPv4 or IPv6, such as `203.0.113.0/24`. Other sources get 403 before authentication. The source is the last `X-Forwarded-For` value, so set it only behind a proxy that sets that header. See [Exposing the HTTP endpoint](#exposing-the-http-endpoint) |
 | `OBSIDIAN_WATCH` | No | `true` | Filesystem watcher for live index updates |
 | `OBSIDIAN_LOG_LEVEL` | No | `info` | `trace`, `debug`, `info`, `warn`, `error` |
 | `OBSIDIAN_TANTIVY` | No | `true` | BM25 full-text index |
