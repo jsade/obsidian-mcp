@@ -205,36 +205,50 @@ async fn serve_http(
 }
 
 /// Serve on a Unix socket file. A socket left at the path by an earlier run is
-/// replaced; any other file there is refused. Mode 0660 lets the owner and its
-/// group connect; the directory holding the socket decides who else can.
+/// replaced; a socket another process still listens on, and any other file,
+/// are refused. Mode 0660 lets the owner and its group connect; the directory
+/// holding the socket decides who else can.
 #[cfg(unix)]
 async fn serve_on_socket(
     socket: &std::path::Path,
     app: axum::Router,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 
-    match std::fs::symlink_metadata(socket) {
-        Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(socket)?,
-        Ok(_) => {
-            return Err(format!(
-                "OBSIDIAN_HTTP_SOCKET: {} exists and is not a socket",
-                socket.display()
-            )
-            .into());
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
+    let refuse = |reason: &str| -> Box<dyn std::error::Error> {
+        format!("OBSIDIAN_HTTP_SOCKET: {}: {reason}", socket.display()).into()
+    };
+    if !socket.is_absolute() {
+        return Err(refuse("must be an absolute path"));
     }
-    let listener = tokio::net::UnixListener::bind(socket)?;
+    match std::fs::symlink_metadata(socket) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            if std::os::unix::net::UnixStream::connect(socket).is_ok() {
+                return Err(refuse("another server is listening on it"));
+            }
+            std::fs::remove_file(socket)?;
+        }
+        Ok(_) => return Err(refuse("exists and is not a socket")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(refuse(&error.to_string())),
+    }
+    let listener = tokio::net::UnixListener::bind(socket)
+        .map_err(|error| refuse(&format!("cannot listen: {error}")))?;
     std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o660))?;
+    let ours = std::fs::symlink_metadata(socket).map(|meta| (meta.dev(), meta.ino()))?;
     tracing::info!(socket = %socket.display(), "HTTP MCP server listening");
 
     let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await;
-    if let Err(error) = std::fs::remove_file(socket) {
-        tracing::warn!(socket = %socket.display(), %error, "cannot remove socket file");
+    // Remove the socket only while it is still this server's.
+    match std::fs::symlink_metadata(socket) {
+        Ok(meta) if (meta.dev(), meta.ino()) == ours => {
+            if let Err(error) = std::fs::remove_file(socket) {
+                tracing::warn!(socket = %socket.display(), %error, "cannot remove socket file");
+            }
+        }
+        _ => tracing::warn!(socket = %socket.display(), "socket file replaced, left in place"),
     }
     Ok(served?)
 }
@@ -540,8 +554,8 @@ async fn handle_cli_flags() -> Option<i32> {
             // These find the server by its TCP port.
             let result = if obsidian_mcp::config::http_socket_from_env().is_some() {
                 Err(format!(
-                    "'{arg}' manages a server on a TCP port; unset OBSIDIAN_HTTP_SOCKET \
-                     or run the socket server under a service manager"
+                    "'{arg}' manages a server on a TCP port and does not run \
+                     while OBSIDIAN_HTTP_SOCKET is set"
                 )
                 .into())
             } else {
@@ -599,7 +613,7 @@ fn print_help() {
              OBSIDIAN_HTTP_PORT      HTTP listen port               [default: 37842]\n    \
              OBSIDIAN_HTTP_HOST      HTTP bind address              [default: 127.0.0.1]\n    \
              OBSIDIAN_HTTP_SOCKET    Listen on this Unix socket file instead  [default: none]\n    \
-             OBSIDIAN_HTTP_AUTH_TOKEN Require this bearer token on /mcp  [default: none]\n    \
+             OBSIDIAN_HTTP_AUTH_TOKEN  Require this bearer token on /mcp  [default: none]\n    \
              OBSIDIAN_HTTP_AUTH_TOKENS_FILE  Named tokens, name:sha256 per line  [default: none]\n    \
              OBSIDIAN_HTTP_ALLOWED_HOSTS  Extra Host names to accept  [default: none]\n    \
              OBSIDIAN_WATCH          Enable filesystem watcher      [default: true]\n    \

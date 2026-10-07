@@ -1550,18 +1550,74 @@ async fn http_refuses_a_socket_path_that_is_another_file() {
     let path = dir.path().join("mcp.sock");
     std::fs::write(&path, "keep me").unwrap();
 
-    let status = timeout(
+    let stderr = refused_socket_start(&vault, &["--http"], &path).await;
+
+    assert!(stderr.contains("exists and is not a socket"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+}
+
+/// Run the binary with `args` and `OBSIDIAN_HTTP_SOCKET=socket`, expect it to
+/// fail, and return its stderr.
+#[cfg(unix)]
+async fn refused_socket_start(vault: &TempDir, args: &[&str], socket: &std::path::Path) -> String {
+    let output = timeout(
         Duration::from_secs(30),
-        server_command(&vault)
-            .arg("--http")
-            .env("OBSIDIAN_HTTP_SOCKET", &path)
-            .stderr(Stdio::null())
-            .status(),
+        server_command(vault)
+            .args(args)
+            .env("OBSIDIAN_HTTP_SOCKET", socket)
+            .stderr(Stdio::piped())
+            .output(),
     )
     .await
     .unwrap()
     .unwrap();
+    assert!(!output.status.success());
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
 
-    assert!(!status.success());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+#[cfg(unix)]
+#[tokio::test]
+async fn http_refuses_a_socket_another_server_listens_on() {
+    let vault = temporary_vault();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("mcp.sock");
+    let _first = start_on_socket(&vault, &socket).await;
+
+    let stderr = refused_socket_start(&vault, &["--http"], &socket).await;
+
+    assert!(stderr.contains("another server is listening"), "{stderr}");
+    assert_eq!(socket_health(&socket).await, "HTTP/1.1 200 OK");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn http_refuses_a_relative_socket_path() {
+    let vault = temporary_vault();
+
+    let stderr = refused_socket_start(&vault, &["--http"], std::path::Path::new("mcp.sock")).await;
+
+    assert!(stderr.contains("must be an absolute path"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lifecycle_commands_refuse_while_a_socket_is_set() {
+    let vault = temporary_vault();
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("mcp.sock");
+
+    for subcommand in ["serve", "stop", "restart"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_obsidian-mcp"))
+            .arg(subcommand)
+            .arg(vault.path())
+            .env("OBSIDIAN_HTTP_SOCKET", &socket)
+            .env("OBSIDIAN_HTTP_PORT", free_port("127.0.0.1").to_string())
+            .output()
+            .await
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{subcommand}");
+        assert!(stderr.contains("TCP port"), "{subcommand}: {stderr}");
+    }
+    assert!(!socket.exists());
 }

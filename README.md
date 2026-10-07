@@ -254,16 +254,17 @@ To limit which folders a client can reach at all, see [Folder scope](#folder-sco
 On a Unix system, `OBSIDIAN_HTTP_SOCKET=/path/to/mcp.sock` makes the HTTP transport listen on that socket file instead of a TCP port. Any account can bind a free loopback port, so a port is safe only while the server holds it. A socket file in a directory that only the server's account and the proxy's account can open cannot be taken over, even while the server restarts.
 
 ```sh
-OBSIDIAN_HTTP_SOCKET=/var/run/vault/mcp.sock obsidian-mcp --http /path/to/vault
+OBSIDIAN_HTTP_SOCKET=/Users/vault/run/mcp.sock obsidian-mcp --http /path/to/vault
 ```
 
 Point the proxy or tunnel at the socket file, for example a `unix:` target.
 
-- The socket gets mode `0660`: its owner and the owner's group can connect. The directory decides who else reaches it.
-- A socket file left at the path by an earlier run is replaced. Any other file at the path stops the server at startup and is left as it is. The server removes the socket when it stops.
-- Start one server per path: a second server on the same path replaces the first one's socket.
+- The path must be absolute and short: macOS allows 104 bytes, Linux 108. `OBSIDIAN_HTTP_HOST` and `OBSIDIAN_HTTP_PORT` are ignored, and no TCP port is opened.
+- The socket gets mode `0660`: its owner and its group can connect. The group is the directory's on macOS, and the process's on Linux unless the directory is setgid. Give the directory to the server's account with the proxy's group and mode `0750`: the proxy needs to enter it, not write to it.
+- A socket left at the path by a server that is gone is replaced. The server refuses to start if another server is listening on the socket, or if any other file is at the path; it leaves that file as it is.
+- On a graceful stop the server removes the socket, unless the file at the path is no longer its own.
 - The `Host` and token rules do not change. A proxy that forwards a public name still needs that name in `OBSIDIAN_HTTP_ALLOWED_HOSTS`.
-- `serve`, `stop` and `restart` manage a server on a TCP port and refuse to run while `OBSIDIAN_HTTP_SOCKET` is set. Run a socket server under launchd or systemd.
+- `serve`, `stop` and `restart` manage a server on a TCP port and refuse to run while `OBSIDIAN_HTTP_SOCKET` is set. Run a socket server under launchd or systemd. `upgrade` cannot check a socket server's health: after an upgrade, restart the service and check it yourself.
 
 ### Server Management
 
