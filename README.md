@@ -666,6 +666,7 @@ OBSIDIAN_DENY_PATHS="Private/,Clients/Contracts/" obsidian-mcp --http
 - An invalid pattern, or one that would cover the whole vault (`*`, `**`, `*.md`), stops the server at startup. A misspelt variable name such as `OBSIDIAN_DENY_PATH` is reported in the log, because it would otherwise leave the vault open.
 - `vault_info` does not show the scope patterns. Its `excluded_notes` count includes scoped-out notes.
 - The scope applies to the whole server. Restart after changing it.
+- The server does not open a denied folder when it builds its index, and its notes are not counted in `excluded_notes`. A folder the server's account may not read is skipped: the log names it at `info` level when it is outside the scope and at `warn` level when it is inside. So when the server runs under its own account, the folders outside the scope, `.obsidian` included, can be closed to that account with file permissions. Only the vault root must stay readable. `periodic` uses its default formats when `.obsidian` cannot be read.
 - The scope covers what the server does. A symlink or hard link that another program creates inside an allowed folder is outside its control: a symlink is checked by where it points, a hard link cannot be told apart from an ordinary file.
 
 ## Architecture

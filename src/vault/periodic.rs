@@ -260,6 +260,11 @@ fn read_json_config<T: serde::de::DeserializeOwned>(path: &Path) -> VaultResult<
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // A `.obsidian` closed to the server's account means the defaults.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            tracing::debug!(path = %path.display(), "config not readable, using defaults");
+            return Ok(None);
+        }
         Err(e) => return Err(VaultError::Io(e)),
     };
     let parsed: T = serde_json::from_str(&content)
@@ -738,6 +743,30 @@ mod tests {
         assert_eq!(config.format, "YYYY-MM-DD");
         assert!(config.folder.is_none());
         assert!(config.template.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_defaults_when_obsidian_unreadable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let obsidian = tmp.path().join(".obsidian");
+        fs::create_dir_all(&obsidian).unwrap();
+        fs::write(
+            obsidian.join("daily-notes.json"),
+            r#"{"format":"DD-MM-YYYY"}"#,
+        )
+        .unwrap();
+        fs::set_permissions(&obsidian, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway: nothing to test then.
+        let closed = fs::read_dir(&obsidian).is_err();
+
+        let config = read_periodic_config(tmp.path(), &NotePeriod::Daily);
+        fs::set_permissions(&obsidian, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if closed {
+            assert_eq!(config.unwrap().format, "YYYY-MM-DD");
+        }
     }
 
     #[test]

@@ -62,16 +62,44 @@ impl VaultIndex {
         let mut non_md_bytes: u64 = 0;
         let mut excluded_note_paths: HashSet<PathBuf> = HashSet::new();
 
+        // A folder the scope denies is not opened at all.
         let walker = WalkDir::new(vault_root)
             .min_depth(1)
             .into_iter()
-            .filter_entry(|e| super::exclude::is_visible_path(Path::new(e.file_name())));
+            .filter_entry(|e| {
+                super::exclude::is_visible_path(Path::new(e.file_name()))
+                    && !(e.file_type().is_dir()
+                        && vault_path::relative_from_absolute(vault_root, e.path())
+                            .is_ok_and(|rel| exclude.denies_dir(&rel)))
+            });
 
         for entry in walker {
-            let entry = entry.map_err(|e| match e.into_io_error() {
-                Some(io_err) => VaultError::Io(io_err),
-                None => VaultError::Other("walkdir: directory loop detected".into()),
-            })?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                // A folder the server may not read is skipped, so one closed
+                // folder cannot stop the server.
+                // The vault root itself must stay readable.
+                Err(e)
+                    if e.io_error().is_some()
+                        && e.path().is_some_and(|path| path != vault_root) =>
+                {
+                    let path = e.path().unwrap_or(vault_root);
+                    let rel = vault_path::relative_from_absolute(vault_root, path)
+                        .unwrap_or_else(|_| path.to_path_buf());
+                    if exclude.is_out_of_scope(&rel) {
+                        tracing::info!(path = %rel.display(), error = %e, "skipping unreadable path outside the folder scope");
+                    } else {
+                        tracing::warn!(path = %rel.display(), error = %e, "skipping unreadable path during index build");
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    return Err(match e.into_io_error() {
+                        Some(io_err) => VaultError::Io(io_err),
+                        None => VaultError::Other("walkdir: directory loop detected".into()),
+                    });
+                }
+            };
 
             if !entry.file_type().is_file() {
                 continue;
@@ -914,6 +942,92 @@ mod tests {
             assert!(!s.contains(".obsidian"), "indexed .obsidian: {s}");
             assert!(!s.starts_with('.'), "indexed hidden file: {s}");
         }
+    }
+
+    /// Close a folder with mode 000. False when the test runs with rights that
+    /// read it anyway (root), so the caller can skip.
+    #[cfg(unix)]
+    fn close_folder(path: &Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o000)).unwrap();
+        stdfs::read_dir(path).is_err()
+    }
+
+    #[cfg(unix)]
+    fn open_folder(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        stdfs::set_permissions(path, stdfs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn scoped_exclude(root: &Path, deny: &[&str], allow: &[&str]) -> Arc<ExcludeSet> {
+        let owned = |patterns: &[&str]| patterns.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let scope = crate::vault::exclude::PathScope::build(&owned(deny), &owned(allow)).unwrap();
+        Arc::new(
+            ExcludeSet::build(vec![])
+                .unwrap()
+                .with_scope(Arc::new(scope), &root.canonicalize().unwrap()),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_skips_an_unreadable_folder() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        stdfs::create_dir_all(root.join("Private")).unwrap();
+        stdfs::write(root.join("Private/secret.md"), "# Secret\n").unwrap();
+        stdfs::create_dir_all(root.join("Docs")).unwrap();
+        stdfs::write(root.join("Docs/p.md"), "# P\n").unwrap();
+        if !close_folder(&root.join("Private")) {
+            open_folder(&root.join("Private"));
+            return;
+        }
+
+        let built = VaultIndex::build(&root, empty_exclude()).await;
+        let scoped = VaultIndex::build(&root, scoped_exclude(&root, &[], &["Docs/"])).await;
+        open_folder(&root.join("Private"));
+
+        for index in [built.unwrap(), scoped.unwrap()] {
+            assert!(index.get_note(Path::new("Docs/p.md")).is_some());
+            assert!(index.get_note(Path::new("Private/secret.md")).is_none());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_does_not_open_a_denied_folder() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        stdfs::create_dir_all(root.join("Private")).unwrap();
+        stdfs::write(root.join("Private/secret.md"), "# Secret\n").unwrap();
+        stdfs::write(root.join("top.md"), "# Top\n").unwrap();
+
+        let index = VaultIndex::build(&root, scoped_exclude(&root, &["Private/"], &[]))
+            .await
+            .unwrap();
+
+        assert!(index.get_note(Path::new("top.md")).is_some());
+        // Not opened, so not even counted as excluded.
+        assert_eq!(index.excluded_notes(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn build_fails_when_the_vault_root_is_unreadable() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().canonicalize().unwrap().join("vault");
+        stdfs::create_dir_all(&root).unwrap();
+        stdfs::write(root.join("top.md"), "# Top\n").unwrap();
+        if !close_folder(&root) {
+            open_folder(&root);
+            return;
+        }
+
+        let built = VaultIndex::build(&root, empty_exclude()).await;
+        open_folder(&root);
+
+        assert!(built.is_err());
     }
 
     #[tokio::test]

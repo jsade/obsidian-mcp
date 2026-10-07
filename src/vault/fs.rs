@@ -199,7 +199,15 @@ pub fn list_files(
                     .unwrap_or(false)
             })
         {
-            let entry = entry.map_err(|e| VaultError::Io(std::io::Error::other(e.to_string())))?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                // A folder below the listed one that cannot be read is left out.
+                Err(e) if e.io_error().is_some() && e.path().is_some_and(|p| p != abs_dir) => {
+                    tracing::warn!(error = %e, "skipping unreadable path in listing");
+                    continue;
+                }
+                Err(e) => return Err(VaultError::Io(std::io::Error::other(e.to_string()))),
+            };
             try_add(entry.path())?;
         }
     } else {
@@ -527,6 +535,32 @@ mod tests {
         assert!(names.contains(&"note1.md".to_string()));
         assert!(names.iter().any(|n| n.contains("nested.md")));
         assert!(!names.iter().any(|n| n.contains(".obsidian")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_recursive_skips_an_unreadable_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let vault = setup_vault();
+        let closed = vault.path().join("closed");
+        fs::create_dir_all(&closed).unwrap();
+        fs::write(closed.join("hidden.md"), "# H").unwrap();
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway: nothing to test then.
+        let is_closed = fs::read_dir(&closed).is_err();
+
+        let files = list_files(vault.path(), Path::new(""), true, None);
+        fs::set_permissions(&closed, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if is_closed {
+            let names: Vec<String> = files
+                .unwrap()
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            assert!(names.contains(&"note1.md".to_string()));
+            assert!(!names.iter().any(|n| n.contains("hidden.md")));
+        }
     }
 
     #[test]
