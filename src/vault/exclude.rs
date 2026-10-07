@@ -232,6 +232,15 @@ impl ExcludeSet {
             .is_some_and(|real| !is_visible_path(&real) || !scope.permits(&real))
     }
 
+    /// Whether a folder scope denies this folder, so a walk need not open it.
+    /// Only a deny pattern counts: a folder off the allow list may still hold
+    /// an allowed folder, as `Team` holds `Team/Internal`.
+    pub fn denies_dir(&self, relative_path: &Path) -> bool {
+        self.scope
+            .as_ref()
+            .is_some_and(|(scope, _)| scope.denies(relative_path))
+    }
+
     /// Check whether a vault-relative path is excluded.
     pub fn is_excluded(&self, relative_path: &Path) -> bool {
         if self.is_out_of_scope(relative_path) {
@@ -663,5 +672,23 @@ Resources/Meetings/
         assert!(set.is_excluded(Path::new("Archive/old.md")));
         assert!(!set.is_excluded(Path::new("Notes/a.md")));
         assert_eq!(set.patterns(), ["Archive/**"]);
+    }
+
+    #[test]
+    fn denies_dir_counts_deny_patterns_only() {
+        let set = ExcludeSet::build(vec![]).unwrap().with_scope(
+            Arc::new(scope(&["Private/"], &["Team/Internal"])),
+            Path::new("/nonexistent"),
+        );
+        assert!(set.denies_dir(Path::new("Private")));
+        assert!(set.denies_dir(Path::new("Private/Old")));
+        // Off the allow list, but it holds an allowed folder.
+        assert!(!set.denies_dir(Path::new("Team")));
+        assert!(!set.denies_dir(Path::new("Team/Internal")));
+        assert!(
+            !ExcludeSet::build(vec![])
+                .unwrap()
+                .denies_dir(Path::new("Private"))
+        );
     }
 }
