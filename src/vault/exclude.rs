@@ -37,9 +37,13 @@ pub struct ExcludeSet {
 /// case-insensitive filesystem serves `contract/x.md` from `Contract/`.
 /// Every pattern covers the entry it names and everything under it, so
 /// `Contract`, `Contract/` and `Contract/**` mean the same.
+///
+/// A read-only list sits beside the scope: a path on it stays readable and
+/// searchable, but no tool creates, changes, moves or deletes it.
 pub struct PathScope {
     deny: GlobSet,
     allow: Option<GlobSet>,
+    read_only: GlobSet,
 }
 
 /// Paths no pattern that names a folder or a file would match. A pattern that
@@ -57,6 +61,7 @@ impl PathScope {
         Self {
             deny: GlobSet::empty(),
             allow: None,
+            read_only: GlobSet::empty(),
         }
     }
 
@@ -68,7 +73,19 @@ impl PathScope {
     pub fn build(deny: &[String], allow: &[String]) -> VaultResult<Self> {
         let deny = Self::compile(deny)?.unwrap_or_else(GlobSet::empty);
         let allow = Self::compile(allow)?;
-        Ok(Self { deny, allow })
+        Ok(Self {
+            deny,
+            allow,
+            read_only: GlobSet::empty(),
+        })
+    }
+
+    /// Make the paths matching `patterns` read-only. The grammar and the
+    /// errors are those of [`PathScope::build`], and a pattern matches under
+    /// any folder when it starts with `**/`, as in `**/CLAUDE.md`.
+    pub fn with_read_only(mut self, patterns: &[String]) -> VaultResult<Self> {
+        self.read_only = Self::compile(patterns)?.unwrap_or_else(GlobSet::empty);
+        Ok(self)
     }
 
     fn compile(patterns: &[String]) -> VaultResult<Option<GlobSet>> {
@@ -133,6 +150,16 @@ impl PathScope {
     /// True when no deny or allow pattern is configured.
     pub fn is_unrestricted(&self) -> bool {
         self.deny.is_empty() && self.allow.is_none()
+    }
+
+    /// True when at least one read-only pattern is configured.
+    pub fn has_read_only(&self) -> bool {
+        !self.read_only.is_empty()
+    }
+
+    /// Whether a vault-relative path matches a read-only pattern.
+    pub fn is_read_only(&self, relative_path: &Path) -> bool {
+        self.has_read_only() && self.read_only.is_match(Self::key(relative_path))
     }
 
     /// Whether a vault-relative path matches a deny pattern.
@@ -690,5 +717,61 @@ Resources/Meetings/
                 .unwrap()
                 .denies_dir(Path::new("Private"))
         );
+    }
+
+    fn read_only(patterns: &[&str]) -> PathScope {
+        let owned: Vec<String> = patterns.iter().map(|p| p.to_string()).collect();
+        PathScope::unrestricted().with_read_only(&owned).unwrap()
+    }
+
+    #[test]
+    fn read_only_matches_a_name_at_any_depth_in_any_spelling() {
+        let scope = read_only(&["**/CLAUDE.md", "**/AGENTS.md"]);
+        assert!(scope.has_read_only());
+        assert!(scope.is_unrestricted(), "read-only is not a folder scope");
+        for path in [
+            "CLAUDE.md",
+            "Notes/CLAUDE.md",
+            "Notes/Sub dir/claude.MD",
+            "Notes/Sub/Agents.md",
+            "Note\u{301}s/CLAUDE.md",
+        ] {
+            assert!(scope.is_read_only(Path::new(path)), "{path}");
+        }
+        for path in [
+            "Notes/MY-CLAUDE.md",
+            "Notes/CLAUDE.md.bak",
+            "Notes/CLAUDE.mdx",
+            "Notes/claude/readme.md",
+            "Notes/a.md",
+        ] {
+            assert!(!scope.is_read_only(Path::new(path)), "{path}");
+        }
+        assert!(
+            scope.permits(Path::new("Notes/CLAUDE.md")),
+            "still readable"
+        );
+    }
+
+    #[test]
+    fn read_only_is_off_unless_configured() {
+        assert!(!PathScope::unrestricted().has_read_only());
+        assert!(!PathScope::unrestricted().is_read_only(Path::new("CLAUDE.md")));
+        let none = PathScope::unrestricted()
+            .with_read_only(&[" ".to_string()])
+            .unwrap();
+        assert!(!none.has_read_only());
+    }
+
+    #[test]
+    fn read_only_refuses_a_pattern_that_would_cover_the_whole_vault() {
+        for pattern in ["*", "**", "*.md", "[bad"] {
+            assert!(
+                PathScope::unrestricted()
+                    .with_read_only(&[pattern.to_string()])
+                    .is_err(),
+                "{pattern}"
+            );
+        }
     }
 }

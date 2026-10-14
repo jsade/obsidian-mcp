@@ -654,6 +654,7 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `OBSIDIAN_EXCLUDE_PATHS` | No | *(empty)* | Comma-separated glob patterns excluded from indexing, search, graph, and stats. Merged with `.obsidian-mcp/ignore`; restart after changing ignore files |
 | `OBSIDIAN_DENY_PATHS` | No | *(empty)* | Comma-separated folder globs that no tool may read, write, move, delete, list or find. See [Folder scope](#folder-scope) |
 | `OBSIDIAN_ALLOW_PATHS` | No | *(empty)* | When set, only paths matching these globs are reachable. See [Folder scope](#folder-scope) |
+| `OBSIDIAN_READONLY_PATHS` | No | *(empty)* | Comma-separated globs of paths that tools may read and search but never create, change, move or delete. See [Read-only paths](#read-only-paths) |
 | `OBSIDIAN_EMBEDDINGS` | No | `false` | Semantic embedding search (requires `embeddings` or `embeddings-api` feature) |
 | `OBSIDIAN_EMBEDDINGS_MODEL` | No | `BAAI/bge-small-en-v1.5` | HuggingFace model for embeddings |
 | `OBSIDIAN_EMBEDDING_PROVIDER` | No | *(infer)* | Embedding backend: `local` (fastembed) or `api` (OpenAI-compatible) |
@@ -698,6 +699,20 @@ OBSIDIAN_DENY_PATHS="Private/,Clients/Contracts/" obsidian-mcp --http
 - An invalid pattern, or one that would cover the whole vault (`*`, `**`, `*.md`), stops the server at startup. A misspelt variable name such as `OBSIDIAN_DENY_PATH` is reported in the log, because it would otherwise leave the vault open.
 - `vault_info` does not show the scope patterns. Its `excluded_notes` count includes scoped-out notes.
 - The scope applies to the whole server. Restart after changing it.
+
+### Read-only paths
+
+`OBSIDIAN_READONLY_PATHS` keeps the notes it names readable and searchable but out of reach of every write. Use it for files an agent should follow but not edit, such as instruction files:
+
+```sh
+OBSIDIAN_READONLY_PATHS="**/CLAUDE.md,**/AGENTS.md" obsidian-mcp --http
+```
+
+- The grammar, the case and Unicode folding, the symlink handling and the startup errors are those of the [folder scope](#folder-scope). `**/CLAUDE.md` matches that name at the vault root and in every folder; `CLAUDE.md` alone matches only the root file.
+- A read-only path is refused with `Read-only` by `note_write`, `note_insert`, `note_patch`, `note_delete`, `frontmatter` (set and remove), `note_move` and `periodic` (create). A move is refused when either end is read-only, so a read-only file can be neither moved away nor replaced by moving another note onto its name. Creating a new note under a read-only name is refused too.
+- While the list is set, `note_move` moves notes only, not folders, because a renamed folder would carry a read-only file with it.
+- The list works with or without a folder scope. Together, a path outside the scope is still refused with `Access denied`.
+- The list binds this server only. A process that writes to the vault another way, such as an editor or a synced client, is not bound by it.
 - At startup the index does not list or descend into a denied folder, so its notes are not counted in `excluded_notes` until one of them changes. A visible folder the server's account may not read is skipped with a `warn` line naming it; a denied folder is skipped without one. So when the server runs under its own account, folders outside the scope, `.obsidian` included, can be closed to that account with file permissions. The vault root, and every folder that holds an allowed folder (`Team` for `Team/Internal`), must stay readable. `periodic` uses its default formats, with a `warn` line, when its config cannot be read. On Linux the file watcher still stops the server on a closed folder: set `OBSIDIAN_WATCH=false` there.
 - The scope covers what the server does. A symlink or hard link that another program creates inside an allowed folder is outside its control: a symlink is checked by where it points, a hard link cannot be told apart from an ordinary file.
 
