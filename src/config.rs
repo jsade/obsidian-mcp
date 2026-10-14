@@ -641,13 +641,15 @@ pub fn http_socket_from_env() -> Option<PathBuf> {
     normalize_optional_path_env("OBSIDIAN_HTTP_SOCKET")
 }
 
-/// Folder scope patterns from `OBSIDIAN_DENY_PATHS` and `OBSIDIAN_ALLOW_PATHS`.
+/// Folder scope patterns from `OBSIDIAN_DENY_PATHS`, `OBSIDIAN_ALLOW_PATHS`
+/// and `OBSIDIAN_READONLY_PATHS`.
 ///
 /// Kept out of [`Config`]: unlike the exclude list, these bound what any
 /// client may reach, and they are handed to `Vault::open_scoped` directly.
 pub struct PathScopeConfig {
     pub deny: Vec<String>,
     pub allow: Vec<String>,
+    pub read_only: Vec<String>,
 }
 
 /// A misspelt scope variable (`OBSIDIAN_DENY_PATH`) would leave the vault
@@ -655,13 +657,16 @@ pub struct PathScopeConfig {
 pub fn warn_on_misnamed_scope_env() {
     for (key, _) in std::env::vars_os() {
         let key = key.to_string_lossy();
-        if (key.starts_with("OBSIDIAN_DENY") || key.starts_with("OBSIDIAN_ALLOW"))
+        if (key.starts_with("OBSIDIAN_DENY")
+            || key.starts_with("OBSIDIAN_ALLOW")
+            || key.starts_with("OBSIDIAN_READONLY"))
             && key != "OBSIDIAN_DENY_PATHS"
             && key != "OBSIDIAN_ALLOW_PATHS"
+            && key != "OBSIDIAN_READONLY_PATHS"
         {
             tracing::warn!(
                 variable = %key,
-                "unknown folder scope variable ignored; use OBSIDIAN_DENY_PATHS or OBSIDIAN_ALLOW_PATHS"
+                "unknown folder scope variable ignored; use OBSIDIAN_DENY_PATHS, OBSIDIAN_ALLOW_PATHS or OBSIDIAN_READONLY_PATHS"
             );
         }
     }
@@ -672,6 +677,7 @@ impl PathScopeConfig {
         Self {
             deny: comma_list_env("OBSIDIAN_DENY_PATHS"),
             allow: comma_list_env("OBSIDIAN_ALLOW_PATHS"),
+            read_only: comma_list_env("OBSIDIAN_READONLY_PATHS"),
         }
     }
 }

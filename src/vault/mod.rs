@@ -330,7 +330,7 @@ impl Vault {
     }
 
     pub fn write_note(&self, path: &Path, content: &str) -> VaultResult<()> {
-        self.guard(path)?;
+        self.guard_write(path)?;
         let _mutation = self.lock_mutations()?;
         frontmatter::parse_frontmatter(content)?;
         let actual_path = fs::write_file(&self.inner.root, path, content)?;
@@ -339,7 +339,7 @@ impl Vault {
     }
 
     pub fn append_note(&self, path: &Path, content: &str) -> VaultResult<()> {
-        self.guard(path)?;
+        self.guard_write(path)?;
         let _mutation = self.lock_mutations()?;
         let combined = match fs::read_file(&self.inner.root, path) {
             Ok(existing) => existing + content,
@@ -360,7 +360,7 @@ impl Vault {
         content: &str,
         frontmatter: Option<&serde_json::Value>,
     ) -> VaultResult<()> {
-        self.guard(path)?;
+        self.guard_write(path)?;
         let _mutation = self.lock_mutations()?;
         if let Some(value) = frontmatter
             && !value.is_object()
@@ -379,7 +379,7 @@ impl Vault {
 
     /// Prepend content after frontmatter (or at the start if none exists).
     pub fn prepend_note(&self, path: &Path, content: &str) -> VaultResult<()> {
-        self.guard(path)?;
+        self.guard_write(path)?;
         let _mutation = self.lock_mutations()?;
         let existing = fs::read_file(&self.inner.root, path)?;
         let new_content = match frontmatter::extract_raw_frontmatter(&existing) {
@@ -399,7 +399,7 @@ impl Vault {
     }
 
     pub fn delete_note(&self, path: &Path) -> VaultResult<()> {
-        self.guard(path)?;
+        self.guard_write(path)?;
         let _mutation = self.lock_mutations()?;
         let actual_path = fs::delete_file(&self.inner.root, path)?;
         self.write_index().remove_file(&actual_path);
@@ -414,13 +414,19 @@ impl Vault {
     }
 
     pub fn move_note(&self, from: &Path, to: &Path) -> VaultResult<PathBuf> {
-        self.guard(from)?;
-        self.guard(to)?;
-        // Renaming a folder would carry a scoped-out subfolder along with it.
-        if !self.inner.scope.is_unrestricted()
+        self.guard_write(from)?;
+        self.guard_write(to)?;
+        // Renaming a folder would carry a scoped-out or read-only entry along
+        // with it.
+        let scoped = !self.inner.scope.is_unrestricted();
+        if (scoped || self.inner.scope.has_read_only())
             && path::resolve_existing(&self.inner.root, from).is_ok_and(|r| r.absolute.is_dir())
         {
-            return Err(VaultError::AccessDenied(from.to_path_buf()));
+            return Err(if scoped {
+                VaultError::AccessDenied(from.to_path_buf())
+            } else {
+                VaultError::ReadOnly(from.to_path_buf())
+            });
         }
         let _mutation = self.lock_mutations()?;
         let move_result = fs::move_file(&self.inner.root, from, to)?;
@@ -443,7 +449,7 @@ impl Vault {
     // ── patch delegation ───────────────────────────────────────────────
 
     pub fn patch_note(&self, path: &Path, request: &PatchRequest) -> VaultResult<()> {
-        self.guard(path)?;
+        self.guard_write(path)?;
         let _mutation = self.lock_mutations()?;
         let content = fs::read_file(&self.inner.root, path)?;
         let patched = patch::apply_patch(&content, request, path)?;
@@ -467,7 +473,7 @@ impl Vault {
         key: &str,
         value: serde_json::Value,
     ) -> VaultResult<()> {
-        self.guard(path)?;
+        self.guard_write(path)?;
         let _mutation = self.lock_mutations()?;
         let content = fs::read_file(&self.inner.root, path)?;
         let updated = frontmatter::set_frontmatter_field(&content, key, value)?;
@@ -478,7 +484,7 @@ impl Vault {
     }
 
     pub fn remove_frontmatter_field(&self, path: &Path, key: &str) -> VaultResult<()> {
-        self.guard(path)?;
+        self.guard_write(path)?;
         let _mutation = self.lock_mutations()?;
         let content = fs::read_file(&self.inner.root, path)?;
         let updated = frontmatter::remove_frontmatter_field(&content, key)?;
@@ -823,7 +829,7 @@ impl Vault {
         let config = periodic::read_periodic_config(&self.inner.root, period)?;
         let date = date.unwrap_or_else(|| Local::now().date_naive());
         let path = periodic::periodic_note_path(&config, &date)?;
-        self.guard(&path)?;
+        self.guard_write(&path)?;
 
         let content = if let Some(custom) = content_override {
             custom.to_owned()
@@ -938,9 +944,38 @@ impl Vault {
         if scope.is_unrestricted() {
             return Ok(());
         }
-        let denied = || VaultError::AccessDenied(path.to_path_buf());
-        let refused =
-            |candidate: &Path| !exclude::is_visible_path(candidate) || !scope.permits(candidate);
+        self.guard_by(
+            path,
+            |candidate| !exclude::is_visible_path(candidate) || !scope.permits(candidate),
+            VaultError::AccessDenied,
+        )
+    }
+
+    /// [`Vault::guard`] for an operation that creates, changes, moves or
+    /// deletes `path`: it also refuses a path on the read-only list, under the
+    /// name given, under the name it resolves to and through a symlink.
+    fn guard_write(&self, path: &Path) -> VaultResult<()> {
+        self.guard(path)?;
+        let scope = &self.inner.scope;
+        if !scope.has_read_only() {
+            return Ok(());
+        }
+        self.guard_by(
+            path,
+            |candidate| scope.is_read_only(candidate),
+            VaultError::ReadOnly,
+        )
+    }
+
+    /// Refuse `path` when `refused` holds for its name, for the location it
+    /// resolves to, or for where a symlink on the way sends it.
+    fn guard_by(
+        &self,
+        path: &Path,
+        refused: impl Fn(&Path) -> bool,
+        error: fn(PathBuf) -> VaultError,
+    ) -> VaultResult<()> {
+        let denied = || error(path.to_path_buf());
         if refused(&path::normalize_relative(path)?) {
             return Err(denied());
         }
@@ -2316,6 +2351,116 @@ mod tests {
         assert!(
             matches!(result, Err(VaultError::AccessDenied(_))),
             "{result:?}"
+        );
+    }
+
+    async fn read_only_vault(deny: &[&str], allow: &[&str]) -> (tempfile::TempDir, Vault) {
+        let dir = tempfile::tempdir().unwrap();
+        crate::test_helpers::create_test_vault(dir.path());
+        for (path, body) in [
+            ("Open/CLAUDE.md", "# Rules\nbody\n"),
+            ("Open/Sub/AGENTS.md", "# Agents\nbody\n"),
+            ("Open/a.md", "# A\nbody\n"),
+            ("CLAUDE.md", "# Root\nbody\n"),
+        ] {
+            std::fs::create_dir_all(dir.path().join(path).parent().unwrap()).unwrap();
+            std::fs::write(dir.path().join(path), body).unwrap();
+        }
+        let owned = |patterns: &[&str]| patterns.iter().map(|p| p.to_string()).collect::<Vec<_>>();
+        let scope = PathScope::build(&owned(deny), &owned(allow))
+            .unwrap()
+            .with_read_only(&owned(&["**/CLAUDE.md", "**/AGENTS.md"]))
+            .unwrap();
+        let config = crate::test_helpers::test_config(dir.path());
+        let vault = Vault::open_scoped(&config, scope).await.unwrap();
+        (dir, vault)
+    }
+
+    fn assert_read_only<T: std::fmt::Debug>(result: VaultResult<T>) {
+        assert!(matches!(result, Err(VaultError::ReadOnly(_))), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn read_only_note_is_readable_and_never_changed() {
+        let (dir, vault) = read_only_vault(&[], &[]).await;
+        let before = |p: &str| std::fs::read(dir.path().join(p)).unwrap();
+        let files = ["Open/CLAUDE.md", "Open/Sub/AGENTS.md", "CLAUDE.md"];
+        for path in files {
+            assert!(vault.read_note(Path::new(path)).is_ok(), "{path}");
+        }
+        let snapshot: Vec<_> = files.iter().map(|p| before(p)).collect();
+        for path in ["Open/CLAUDE.md", "open/claude.md", "Open/Sub/../CLAUDE.md"] {
+            let path = Path::new(path);
+            assert_read_only(vault.write_note(path, "x"));
+            assert_read_only(vault.append_note(path, "x"));
+            assert_read_only(vault.prepend_note(path, "x"));
+            assert_read_only(vault.delete_note(path));
+            assert_read_only(vault.set_frontmatter_field(path, "k", serde_json::json!("v")));
+            assert_read_only(vault.remove_frontmatter_field(path, "k"));
+            assert_read_only(vault.move_note(path, Path::new("Open/moved.md")));
+            assert_read_only(vault.move_note(Path::new("Open/a.md"), path));
+        }
+        assert_read_only(vault.write_note(Path::new("Open/Sub/AGENTS.md"), "x"));
+        assert_read_only(vault.write_note(Path::new("CLAUDE.md"), "x"));
+        // A new one is refused as well, so a folder cannot grow its own.
+        assert_read_only(vault.create_note(Path::new("Open/New/CLAUDE.md"), "x", None));
+        assert_read_only(vault.write_note(Path::new("Open/new/agents.md"), "x"));
+        assert_read_only(vault.move_note(Path::new("Open/a.md"), Path::new("Open/New/AGENTS.md")));
+        // A folder rename would carry one along.
+        assert_read_only(vault.move_note(Path::new("Open/Sub"), Path::new("Open/Sub2")));
+        // Control: a neighbour in the same folder is unaffected.
+        vault
+            .write_note(Path::new("Open/a.md"), "# A\nchanged\n")
+            .unwrap();
+        vault
+            .move_note(Path::new("Open/a.md"), Path::new("Open/b.md"))
+            .unwrap();
+        vault.delete_note(Path::new("Open/b.md")).unwrap();
+        let after: Vec<_> = files.iter().map(|p| before(p)).collect();
+        assert_eq!(snapshot, after);
+        assert!(!dir.path().join("Open/New").exists());
+        assert!(dir.path().join("Open/Sub/AGENTS.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn read_only_note_stays_visible_to_search_and_listing() {
+        let (_dir, vault) = read_only_vault(&[], &[]).await;
+        assert!(vault.get_note_metadata(Path::new("Open/CLAUDE.md")).is_ok());
+        let found = vault.search_text("Rules", 20).unwrap();
+        assert!(
+            found.iter().any(|r| r.path.ends_with("CLAUDE.md")),
+            "{found:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_works_beside_a_folder_scope() {
+        let (_dir, vault) = read_only_vault(&[], &["Open/", "CLAUDE.md"]).await;
+        assert!(vault.read_note(Path::new("CLAUDE.md")).is_ok());
+        assert_read_only(vault.write_note(Path::new("CLAUDE.md"), "x"));
+        assert_read_only(vault.write_note(Path::new("Open/CLAUDE.md"), "x"));
+        // A path off the allow list is still out of scope, not read-only.
+        assert_denied(vault.write_note(Path::new("Elsewhere/CLAUDE.md"), "x"));
+        assert_denied(vault.move_note(Path::new("Open/Sub"), Path::new("Open/Sub2")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_only_note_is_refused_through_a_symlink() {
+        let (dir, vault) = read_only_vault(&[], &[]).await;
+        std::os::unix::fs::symlink(
+            dir.path().join("Open/CLAUDE.md"),
+            dir.path().join("Open/alias.md"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path().join("Open/Sub"), dir.path().join("Open/via"))
+            .unwrap();
+        assert_read_only(vault.write_note(Path::new("Open/alias.md"), "x"));
+        assert_read_only(vault.delete_note(Path::new("Open/alias.md")));
+        assert_read_only(vault.write_note(Path::new("Open/via/AGENTS.md"), "x"));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Open/CLAUDE.md")).unwrap(),
+            "# Rules\nbody\n"
         );
     }
 

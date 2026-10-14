@@ -782,6 +782,128 @@ async fn allow_list_limits_the_server_to_the_listed_folders() {
     server.stop().await;
 }
 
+const INSTRUCTION_FILES: [&str; 3] = ["CLAUDE.md", "Open/CLAUDE.md", "Open/Sub/AGENTS.md"];
+
+fn seed_instruction_vault(root: &std::path::Path) {
+    std::fs::create_dir_all(root.join("Open/Sub")).unwrap();
+    for path in INSTRUCTION_FILES {
+        std::fs::write(
+            root.join(path),
+            "---\nstatus: sealed\n---\n# Rules\nlion rules\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(root.join("Open/public.md"), "# Public\nlion\n").unwrap();
+}
+
+fn instruction_files(root: &std::path::Path) -> Vec<String> {
+    INSTRUCTION_FILES
+        .iter()
+        .map(|path| std::fs::read_to_string(root.join(path)).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn read_only_paths_can_be_read_but_no_tool_changes_them() {
+    let server = HttpServer::start_custom(
+        "full",
+        "127.0.0.1",
+        &[
+            ("OBSIDIAN_ALLOW_PATHS", "Open/,CLAUDE.md"),
+            ("OBSIDIAN_READONLY_PATHS", "**/CLAUDE.md,**/AGENTS.md"),
+        ],
+        seed_instruction_vault,
+    )
+    .await;
+    let before = instruction_files(server.vault.path());
+
+    // Controls: reads and searches work, and a neighbour can still be changed.
+    for path in INSTRUCTION_FILES {
+        let read = server.call("note_read", json!({"path": path})).await;
+        assert!(!is_refused(&read), "{path}: {read}");
+    }
+    let found = server.call("search_text", json!({"query": "lion"})).await;
+    assert!(found.to_string().contains("Open/CLAUDE.md"), "{found}");
+    let written = server
+        .call(
+            "note_write",
+            json!({"path": "Open/public.md", "content": "# Public\nchanged\n"}),
+        )
+        .await;
+    assert!(!is_refused(&written), "{written}");
+
+    let mut targets: Vec<String> = INSTRUCTION_FILES.iter().map(|p| p.to_string()).collect();
+    targets.push("open/claude.md".into());
+    targets.push("Open/Sub/../CLAUDE.md".into());
+    for path in &targets {
+        let calls = [
+            (
+                "note_write",
+                json!({"path": path, "content": "overwritten"}),
+            ),
+            ("note_insert", json!({"path": path, "content": "inserted"})),
+            (
+                "note_patch",
+                json!({
+                    "path": path, "operation": "append", "target_type": "heading",
+                    "target": "Rules", "content": "patched"
+                }),
+            ),
+            ("note_delete", json!({"path": path, "confirm": true})),
+            (
+                "frontmatter",
+                json!({"action": "set", "path": path, "key": "status", "value": "open"}),
+            ),
+            (
+                "frontmatter",
+                json!({"action": "remove", "path": path, "key": "status"}),
+            ),
+            ("note_move", json!({"from": path, "to": "Open/taken.md"})),
+            ("note_move", json!({"from": "Open/public.md", "to": path})),
+        ];
+        for (tool, arguments) in calls {
+            let response = server.call(tool, arguments.clone()).await;
+            assert!(is_refused(&response), "{tool} {arguments}: {response}");
+        }
+    }
+    // A new one cannot be made, by creating or by moving a note into the name.
+    for path in ["Open/New/CLAUDE.md", "open/new/agents.md"] {
+        let response = server
+            .call("note_create", json!({"path": path, "content": "planted"}))
+            .await;
+        assert!(is_refused(&response), "{path}: {response}");
+        assert!(response.to_string().contains("Read-only"), "{response}");
+        let response = server
+            .call("note_move", json!({"from": "Open/public.md", "to": path}))
+            .await;
+        assert!(is_refused(&response), "{path}: {response}");
+    }
+    // A folder rename would carry an instruction file along.
+    let response = server
+        .call("note_move", json!({"from": "Open/Sub", "to": "Open/Sub2"}))
+        .await;
+    assert!(is_refused(&response), "{response}");
+
+    assert_eq!(instruction_files(server.vault.path()), before);
+    assert!(server.vault.path().join("Open/public.md").is_file());
+    assert!(!server.vault.path().join("Open/taken.md").exists());
+    assert!(!server.vault.path().join("Open/New").exists());
+    assert!(!server.vault.path().join("Open/Sub2").exists());
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn an_invalid_read_only_pattern_stops_the_server() {
+    let vault = temporary_vault();
+    let status = server_command(&vault)
+        .env("OBSIDIAN_READONLY_PATHS", "**/CLAUDE.md,[bad")
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .unwrap();
+    assert!(!status.success());
+}
+
 #[tokio::test]
 async fn an_invalid_scope_pattern_stops_the_server() {
     let vault = temporary_vault();

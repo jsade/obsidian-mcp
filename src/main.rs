@@ -57,7 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     obsidian_mcp::config::warn_on_misnamed_scope_env();
     let scope = obsidian_mcp::config::PathScopeConfig::from_env();
-    let scope = obsidian_mcp::vault::exclude::PathScope::build(&scope.deny, &scope.allow)?;
+    let scope = obsidian_mcp::vault::exclude::PathScope::build(&scope.deny, &scope.allow)?
+        .with_read_only(&scope.read_only)?;
     // The semantic daemon indexes and embeds the whole vault on its own, so a
     // scoped server must not attach the vault to it.
     if !scope.is_unrestricted() && semantic_runtime_config.mode != SemanticMode::Local {
@@ -712,7 +713,8 @@ fn print_help() {
              OBSIDIAN_MCP_DATA       External data dir for embeddings  [default: {{vault}}/.obsidian-mcp]\n    \
              OBSIDIAN_EXCLUDE_PATHS  Comma-separated exclusion globs   [default: none]\n    \
              OBSIDIAN_DENY_PATHS     Folders no tool may reach         [default: none]\n    \
-             OBSIDIAN_ALLOW_PATHS    Only these folders are reachable  [default: all]",
+             OBSIDIAN_ALLOW_PATHS    Only these folders are reachable  [default: all]\n    \
+             OBSIDIAN_READONLY_PATHS Readable, never changed or removed [default: none]",
         name = env!("CARGO_PKG_NAME"),
         version = env!("CARGO_PKG_VERSION"),
         description = env!("CARGO_PKG_DESCRIPTION"),
