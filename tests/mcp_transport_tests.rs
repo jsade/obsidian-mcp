@@ -545,6 +545,107 @@ async fn http_requires_the_configured_bearer_token_on_mcp_only() {
     server.stop().await;
 }
 
+#[tokio::test]
+async fn x_api_key_carries_the_token_when_authorization_holds_no_bearer_token() {
+    // An access proxy's own credential, as it arrives in `Authorization`.
+    const PROXY: &str = r#"{"client-id":"edge","client-secret":"edge-secret"}"#;
+    let config = tempfile::tempdir().unwrap();
+    let tokens = config.path().join("tokens");
+    std::fs::write(
+        &tokens,
+        token_line("laptop", "laptop-token") + &token_line("phone", "phone-token"),
+    )
+    .unwrap();
+    let server = HttpServer::start_custom(
+        "full",
+        "127.0.0.1",
+        &[("OBSIDIAN_HTTP_AUTH_TOKENS_FILE", tokens.to_str().unwrap())],
+        |_| {},
+    )
+    .await;
+    let status = async |authorization: Option<&str>, api_key: Option<&str>| {
+        let mut request = server.request("server/discover", json!({}), MODERN);
+        if let Some(value) = authorization {
+            request = request.header("Authorization", value);
+        }
+        if let Some(value) = api_key {
+            request = request.header("X-API-Key", value);
+        }
+        request.send().await.unwrap().status()
+    };
+    for (authorization, api_key, expected) in [
+        (None, Some("laptop-token"), StatusCode::OK),
+        (Some(PROXY), Some("laptop-token"), StatusCode::OK),
+        (Some("Basic cHJveHk="), Some("phone-token"), StatusCode::OK),
+        (
+            Some("Bearer laptop-token"),
+            Some("unknown-token"),
+            StatusCode::OK,
+        ),
+        (None, Some("unknown-token"), StatusCode::UNAUTHORIZED),
+        (None, Some("Bearer laptop-token"), StatusCode::UNAUTHORIZED),
+        (Some(PROXY), None, StatusCode::UNAUTHORIZED),
+        // A Bearer token decides even when it is wrong.
+        (
+            Some("Bearer unknown-token"),
+            Some("laptop-token"),
+            StatusCode::UNAUTHORIZED,
+        ),
+    ] {
+        assert_eq!(
+            status(authorization, api_key).await,
+            expected,
+            "{authorization:?} {api_key:?}"
+        );
+    }
+
+    // A session opened through X-API-Key belongs to that token, whichever
+    // header carries it later.
+    let opened = server
+        .request(
+            "initialize",
+            json!({
+                "protocolVersion": LEGACY,
+                "capabilities": {},
+                "clientInfo": {"name": "legacy-client", "version": "1"}
+            }),
+            LEGACY,
+        )
+        .header("Authorization", PROXY)
+        .header("X-API-Key", "laptop-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), StatusCode::OK);
+    let session = opened.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let session_status = async |header: &str, value: &str| {
+        server
+            .request("tools/list", json!({}), LEGACY)
+            .header("Mcp-Session-Id", &session)
+            .header(header, value)
+            .send()
+            .await
+            .unwrap()
+            .status()
+    };
+    assert_eq!(
+        session_status("X-API-Key", "phone-token").await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        session_status("X-API-Key", "laptop-token").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        session_status("Authorization", "Bearer laptop-token").await,
+        StatusCode::OK
+    );
+    server.stop().await;
+}
+
 const SECRET: &str = "TOPSECRET";
 const DENIED_NOTES: [&str; 3] = ["Contract/wo.md", "People/staff.md", "Minutes/m1.md"];
 

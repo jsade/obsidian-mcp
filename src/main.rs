@@ -356,9 +356,13 @@ struct HttpAuth {
     sessions: obsidian_mcp::http_auth::SessionOwners,
 }
 
-/// Refuse an MCP request unless it carries `Authorization: Bearer <token>`
-/// with a known token, and record that token's name for the write log. A
-/// session answers only to the token that opened it.
+/// Refuse an MCP request unless it carries a known token, and record that
+/// token's name for the write log. The token comes from
+/// `Authorization: Bearer <token>`, or from `X-API-Key: <token>` when
+/// `Authorization` holds no Bearer token, as behind an access proxy that reads
+/// its own credential from `Authorization`. A Bearer token always decides, so
+/// a request cannot fall back to a second token. A session answers only to
+/// the token that opened it.
 /// `/health` sits outside this layer so `serve` and `restart` can probe it.
 async fn bearer_auth_middleware(
     axum::extract::State(auth): axum::extract::State<Arc<HttpAuth>>,
@@ -370,16 +374,23 @@ async fn bearer_auth_middleware(
     use obsidian_mcp::http_auth::SessionAccess;
 
     const SESSION_HEADER: &str = "mcp-session-id";
+    const API_KEY_HEADER: &str = "x-api-key";
 
-    let client = request
-        .headers()
+    let headers = request.headers();
+    let presented = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split_once(' '))
         .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
-        .and_then(|(_, presented)| auth.tokens.authenticate(presented.trim()));
+        .map(|(_, presented)| presented)
+        .or_else(|| {
+            headers
+                .get(API_KEY_HEADER)
+                .and_then(|value| value.to_str().ok())
+        });
+    let client = presented.and_then(|presented| auth.tokens.authenticate(presented.trim()));
     let Some(client) = client else {
-        tracing::warn!("rejected HTTP MCP request without a valid bearer token");
+        tracing::warn!("rejected HTTP MCP request without a valid token");
         return (
             StatusCode::UNAUTHORIZED,
             [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
