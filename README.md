@@ -229,6 +229,12 @@ OBSIDIAN_HTTP_AUTH_TOKENS_FILE=/path/to/tokens obsidian-mcp --http /path/to/vaul
 - `OBSIDIAN_HTTP_AUTH_TOKEN` still works, alone or beside the file. It appears in the write log under the name `default`. The file may not use the names `default`, `anonymous` or `stdio`. Changing or removing this token needs a restart.
 - Keep the token file outside the vault, readable only by the server's user.
 
+**Behind an access proxy.** A client may send its token as `X-API-Key: <token>` instead of `Authorization: Bearer <token>`. This is for a proxy in front of the server that reads its own credential from `Authorization`, so the server's token has to travel in another header. The rules:
+
+- A request whose `Authorization` header holds a Bearer token is judged by that token alone; `X-API-Key` is then ignored, even when the Bearer token is wrong.
+- Otherwise the server reads `X-API-Key`. Its value is the bare token, with no `Bearer` prefix.
+- The same tokens work in either header, and a session belongs to the token that opened it, whichever header carried it.
+
 **Write log.** Every call that changes the vault writes one line to the log (stderr), whatever `OBSIDIAN_LOG_LEVEL` is:
 
 ```text
@@ -642,7 +648,7 @@ The `read` profile exposes frontmatter as part of the raw Markdown returned by `
 | `OBSIDIAN_HTTP_PORT` | No | `37842` | HTTP listen port |
 | `OBSIDIAN_HTTP_HOST` | No | `127.0.0.1` | HTTP bind address |
 | `OBSIDIAN_HTTP_SOCKET` | No | *(none)* | Unix only: listen on this socket file instead of a TCP port. See [Listening on a socket file](#listening-on-a-socket-file) |
-| `OBSIDIAN_HTTP_AUTH_TOKEN` | No | *(none)* | When set, every `/mcp` request must send `Authorization: Bearer <token>` (401 otherwise). `/health` stays open |
+| `OBSIDIAN_HTTP_AUTH_TOKEN` | No | *(none)* | When set, every `/mcp` request must send `Authorization: Bearer <token>`, or `X-API-Key: <token>` when `Authorization` holds no Bearer token (401 otherwise). `/health` stays open |
 | `OBSIDIAN_HTTP_AUTH_TOKENS_FILE` | No | *(none)* | File of named tokens, one `name:sha256-hex` per line. Removing a line revokes that token without a restart. See [Exposing the HTTP endpoint](#exposing-the-http-endpoint) |
 | `OBSIDIAN_HTTP_ALLOWED_HOSTS` | No | *(none)* | Comma-separated extra `Host` names to accept, for a public name or a tunnel: `vault.example.com` (any port) or `vault.example.com:8443` |
 | `OBSIDIAN_HTTP_ALLOWED_SOURCES` | No | *(any)* | Comma-separated CIDR blocks, IPv4 or IPv6, such as `203.0.113.0/24`. Other sources get 403 before authentication. The source is the last `X-Forwarded-For` value, so set it only behind a proxy that sets that header. See [Exposing the HTTP endpoint](#exposing-the-http-endpoint) |
